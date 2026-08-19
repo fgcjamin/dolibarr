@@ -281,7 +281,8 @@ class AccountingJournals extends DolibarrApi
 	 * Write pending accounting movements for a journal into the general ledger.
 	 *
 	 * Supported journal natures: 1 (various operations, wraps AccountingJournal::getData()+
-	 * writeIntoBookkeeping()) and 5 (expense reports, wraps AccountingJournal::
+	 * writeIntoBookkeeping()), 2 (sells, wraps AccountingJournal::
+	 * writeIntoBookkeepingForSells()), and 5 (expense reports, wraps AccountingJournal::
 	 * writeIntoBookkeepingForExpenseReports()). Other natures are not yet implemented via API -
 	 * see roadmap/backlog.md Phase 3b.
 	 *
@@ -320,6 +321,8 @@ class AccountingJournals extends DolibarrApi
 		if ((int) $journal->nature === 1) {
 			$journal_data = $journal->getData(DolibarrApiAccess::$user, 'bookkeeping', $date_start, $date_end, 'notyet');
 			$result = $journal->writeIntoBookkeeping(DolibarrApiAccess::$user, $journal_data);
+		} elseif ((int) $journal->nature === 2) {
+			$result = $journal->writeIntoBookkeepingForSells(DolibarrApiAccess::$user, $date_start, $date_end);
 		} elseif ((int) $journal->nature === 5) {
 			$result = $journal->writeIntoBookkeepingForExpenseReports(DolibarrApiAccess::$user, $date_start, $date_end);
 		} else {
@@ -373,6 +376,11 @@ class AccountingJournals extends DolibarrApi
 			$journal_data = $journal->getData(DolibarrApiAccess::$user, 'bookkeeping', (int) $date_start, (int) $date_end, 'notyet');
 			foreach ($journal_data as $element) {
 				$items[] = array('ref' => (string) (!empty($element['ref']) ? $element['ref'] : ''), 'has_error' => !empty($element['error']));
+			}
+		} elseif ((int) $journal->nature === 2) {
+			$data = $journal->getDataForSells(DolibarrApiAccess::$user, (int) $date_start, (int) $date_end, 'notyet');
+			foreach ($data['tabfac'] as $key => $val) {
+				$items[] = array('ref' => (string) $val['ref'], 'has_error' => !empty($data['errorforinvoice'][$key]));
 			}
 		} elseif ((int) $journal->nature === 5) {
 			$data = $journal->getDataForExpenseReports(DolibarrApiAccess::$user, (int) $date_start, (int) $date_end, 'notyet');

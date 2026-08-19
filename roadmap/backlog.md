@@ -46,8 +46,31 @@ via the already-correct `getData()`/`writeIntoBookkeeping()`, `5` via the new ex
 methods, anything else `400`), and the `BookKeeping::create()` return-value fix in
 `htdocs/accountancy/class/bookkeeping.class.php` (audited all 12 production call sites first —
 all safe). Test coverage in `test/phpunit/AccountingJournalExpenseReportsTransferTest.php` and
-the corrected assertion in `test/phpunit/BookKeepingTest.php::testBookKeepingCreate()`. Sells,
-purchases, bank, and treasury remain open — see the rewritten Phase 3b section below.
+the corrected assertion in `test/phpunit/BookKeepingTest.php::testBookKeepingCreate()`. Purchases,
+bank, and treasury remain open — see the rewritten Phase 3b section below.
+
+Phase 3b, second slice (sells journal transfer) has been implemented — see
+`AccountingJournal::getDataForSells()`/`writeIntoBookkeepingForSells()` in
+`htdocs/accountancy/class/accountingjournal.class.php`, a verbatim lift of
+`accountancy/journal/sellsjournal.php`'s former inline data-collection (5 hook points, richer
+than expense reports: `doActions`, `printFieldListSelect`/`From`/`Where`,
+`processingJournalData`, `processedJournalData`) and write loop (5 `create()` sites: warranty,
+thirdparty with an auto-lettering side effect, product/service, VAT, revenue stamp; plus the
+replaced-invoice skip guard). Wired into `POST journals/{id}/transfer`/
+`GET journals/{id}/pendingdata` as nature `2`. Verified against a golden pre-refactor baseline
+(byte-for-byte match via both the page's own call sequence and the class method alone),
+idempotency, and the replaced-invoice guard. **Caught and fixed one real bug during this
+extraction**: the initial lift dropped data-collection's `$error++` on the
+`ACCOUNTANCY_MAX_TOO_MANY_LINES_TO_PROCESS` too-many-lines guard, which — since the page's
+write-action gate reads that `$error` — would have silently let the write proceed on truncated
+data instead of being blocked like the original. Fixed by threading an `'error'` count through
+`getDataForSells()`'s return, having the page accumulate it, and having
+`writeIntoBookkeepingForSells()` itself refuse to run if data-collection signaled it (a
+phpstan "always true" finding on the write-action's `if` condition surfaced the gap — worth
+re-running phpstan after any future journal extraction, not just lint/phpcs, for exactly this
+class of subtle omission). Test coverage in
+`test/phpunit/AccountingJournalSellsTransferTest.php`. Purchases, bank, and treasury remain
+open — see the rewritten Phase 3b section below.
 
 This backlog covers the remaining phases needed for the accountancy module's REST API to
 fully drive the module end to end (recurring operations: binding, ledger transfer, closure,
@@ -189,131 +212,175 @@ why: it doesn't touch the `DolibarrApi` autoloader chain that breaks under this 
 scratch phpunit install). Live smoke tests for the two new endpoints (nature 1 and nature 5, plus
 the `400` for an unsupported nature) also passed.
 
-### Phase 3b, remaining slice — sells, purchases, bank, treasury
+### Phase 3b, remaining slice — purchases, bank, treasury
 
-**This is still the genuinely risky part of Phase 3.** The 4 largest, most special-case-laden
-journal pages are untouched.
+**This is still the genuinely risky part of Phase 3.** The 3 largest, most special-case-laden
+journal pages are untouched. Sells and expense reports are both done now (see status paragraphs
+above) and between them fully validate the extraction pattern below, including a real bug the
+pattern's own verification caught (see the phpstan note at the end of this section) — treat that
+as required reading before starting the next journal, not optional context.
 
-**Important correction to the original assumption**: the backlog originally assumed each
+**Correction to the original assumption, now proven twice**: the backlog originally assumed each
 journal's write logic could be extracted with a simple `($user, $date_start, $date_end)`
 signature by redoing a generic date-range query inside the class, the way
-`variousjournal.php`'s already-migrated `getData()`/`writeIntoBookkeeping()` works. Deep
-research (and the successful expense-reports extraction above) showed this only actually holds
-for `variousjournal.php` (nature 1). Every other journal — expense reports included — has its
-own bespoke, often hook-coupled data-collection SQL and per-journal keying convention (flat
+`variousjournal.php`'s already-migrated `getData()`/`writeIntoBookkeeping()` works. This only
+actually holds for `variousjournal.php` (nature 1). Every other journal has its own bespoke,
+often hook-coupled data-collection SQL and per-journal keying convention (flat
 `$tabht`/`$tabtva`/`$tabttc`-style arrays, not the generic `blocks` structure
-`writeIntoBookkeeping()` expects). So each of sells/purchases/bank/treasury will need its own
+`writeIntoBookkeeping()` expects). So each of purchases/bank/treasury needs its own
 `getDataForXxx()` + `writeIntoBookkeepingForXxx()` pair, following the exact pattern established
-for expense reports above (lift **both** the data-collection query and the write loop into the
-class, verbatim, so the pair is self-contained and API-callable) — not a smaller "just extract
-the write loop, leave data-collection on the page" version, since that wouldn't support a
-REST transfer endpoint standalone.
+for expense reports and sells (lift **both** the data-collection query and the write loop into
+the class, verbatim, so the pair is self-contained and API-callable) — not a smaller "just
+extract the write loop, leave data-collection on the page" version, since that wouldn't support
+a REST transfer endpoint standalone.
 
 `BookKeeping` (`htdocs/accountancy/class/bookkeeping.class.php`) already has full
 CRUD/list/balance (`create`, `createFromValues`, `createStd`, `fetch*`, `update*`, `delete*`,
 `export_bookkeeping`, `transformTransaction`, `canModifyBookkeeping`, `validBookkeepingDate`,
 `assignAccountMass`) — straightforward wrap. `AccountingJournal::writeIntoBookkeeping()`
 (line 1454) is already the reusable transfer method for the "various operations" journal only
-(used by `htdocs/accountancy/journal/variousjournal.php`, action block at lines 131-150). Its
-structure (confirmed by reading it in full): fires an `accountingjournaldao`/`writeBookkeeping`
-hook first (if the hook fully replaces native logic, native processing is skipped entirely);
-otherwise loops `$journal_data` per document, builds a `BookKeeping` object per line from a
-normalized `$element['blocks']` array, calls `create()`, aggregates errors
-(`alreadyjournalized`/`other`/`amountsnotbalanced`), commits/rolls back per document, and stops
-early once `$max_nb_errors` (default 10) is hit. Returns `$error ? -$error : 1` — the convention
-any new `POST journals/{id}/transfer` endpoint should mirror. The page-level glue in
-`variousjournal.php` is thin (`getData($user, 'bookkeeping', ...)` builds `$journal_data`,
-`writeIntoBookkeeping($user, $journal_data)` writes it, `setEventMessages()` on the result) —
-this is the template to match for the other 5 pages' endpoints and extracted methods.
+(used by `htdocs/accountancy/journal/variousjournal.php`). Its structure: fires an
+`accountingjournaldao`/`writeBookkeeping` hook first (if the hook fully replaces native logic,
+native processing is skipped entirely); otherwise loops `$journal_data` per document, builds a
+`BookKeeping` object per line from a normalized `$element['blocks']` array, calls `create()`,
+aggregates errors (`alreadyjournalized`/`other`/`amountsnotbalanced`), commits/rolls back per
+document, and stops early once `$max_nb_errors` is hit. Returns `$error ? -$error : 1` — the
+convention every extracted `writeIntoBookkeepingForXxx()` mirrors.
 
-`AccountingJournal::getLibType()` is a **label-only** dispatch (`$nature` → translated string
-via `LibType()`), not a functional dispatch — there is no existing `$nature`-keyed routing table
-from a journal to its transfer page/method. `POST journals/{id}/transfer` will need to build one
-from scratch: nature 1→various, 2→sells, 3→purchases, 4→bank/treasury (two pages share nature
-4 — `bankjournal.php`/`treasuryjournal.php` — decide the dispatch key between them, e.g. by
-journal code, not just nature), 5→expense reports. Note nature 8 (inventory) has no `LibType()`
-label at all today (missing `elseif ($nature == 8)` branch) — a separate minor pre-existing gap,
-worth a one-line fix alongside 3b but not blocking it.
+`AccountingJournal::getLibType()` is a **label-only** dispatch (`$nature` → translated string),
+not a functional dispatch. The API's nature-based dispatch (`AccountingJournals::transfer()`/
+`pendingData()` in `htdocs/accountancy/class/api_accountingjournals.class.php`) currently
+supports natures `1` (various) and `2` (sells); `3` (purchases) and `5` (expense reports) are
+the next straightforward additions — but **nature `4` (bank/treasury) needs special handling,
+not a simple `elseif`**, see below.
 
-The other 4 journal types duplicate this kind of logic **inline** instead of factoring it. Exact
-block boundaries (all guarded by `action == 'writebookkeeping'`, confirmed via grep):
+| Journal | Page | Inline block lines | Approx. size | Status |
+|---|---|---|---|---|
+| Sales | `sellsjournal.php` | 496-921 (pre-refactor) | ~425 lines | **Done** |
+| Expense reports | `expensereportsjournal.php` | 276-542 (pre-refactor) | ~265 lines | **Done** |
+| Purchases | `purchasesjournal.php` | 444-827 | ~385 lines | Remaining |
+| Bank | `bankjournal.php` | 716-1084 | ~370 lines | Remaining |
+| Treasury | `treasuryjournal.php` | 1134-1355 | ~220 lines | Remaining |
 
-| Journal | Page | Inline block lines | Approx. size |
-|---|---|---|---|
-| Sales | `sellsjournal.php` | 497-921 | ~425 lines |
-| Purchases | `purchasesjournal.php` | 445-830 | ~385 lines |
-| Bank | `bankjournal.php` | 716-1208 | ~490 lines (largest — highest risk) |
-| Treasury | `treasuryjournal.php` | 1135-1359 | ~225 lines |
-| Expense reports | `expensereportsjournal.php` | 276-542 | ~265 lines |
+#### Purchases (nature 3)
 
-`treasuryjournal.php`'s permission check is currently **commented out**
-(`if ($action == 'writebookkeeping' /* && $user->hasRight(...) */)` with a "test on permission
-already done" note) — a minor pre-existing inconsistency vs. the other 4 pages' inline
-`$user->hasRight('accounting', 'bind', 'write')` check. Worth normalizing during the 3b
-extraction (all 5 should end up with the same explicit check the shared method or its callers
-enforce), not silently fixed as an unrelated drive-by before that.
+Data-collection (`purchasesjournal.php:142-442`): one main query (hooks `printFieldListSelect`/
+`From`/`Where`, context `purchasesjournal`) against `facture_fourn_det`, plus a second
+unbound-lines query — same shape as sells/expense-reports. Per-row aggregation is
+**meaningfully richer** than either done-so-far journal:
+- `$tabfac`/`$tabttc`/`$tabht`/`$tabtva`/`$tablocaltax1`/`$tablocaltax2`/`$tabcompany`/`$def_tva`
+  — same family as sells.
+- `$tabother[$key][$counterpart_account]` — VAT-NPR (non-récupérable) counterpart amounts, **not
+  pre-initialized to 0** like the others (guard every read with `isset(...) && is_array(...)`).
+- `$tabrctva`/`$tabrclocaltax1`/`$tabrclocaltax2` — VAT reverse-charge credit/debit counterpart
+  entries, built only when `($mysoc->country_code=='FR' || ACCOUNTING_FORCE_ENABLE_VAT_REVERSE_CHARGE)
+  && $obj->vat_reverse_charge==1 && (EEC || ACCOUNTING_REVERSE_CHARGE_ALSO_NON_EEC)`.
 
-`sellsjournal.php` (read in full while scoping this) is representative of the pattern: loops
-`foreach ($tabfac as $key => $val)` (one iteration per invoice, not per line), creates up to 5
-distinct kinds of `BookKeeping` rows per invoice (retained-warranty, thirdparty/customer,
-product/service revenue, VAT/localtax, revenue-stamp), wraps each invoice in
-`$db->begin()/commit()/rollback()` with a debit/credit balance check before commit, and aborts
-after 10 accumulated errors — all logic `writeIntoBookkeeping()` already has, just operating on
-raw page-local arrays (`$tabfac`, `$tabttc`, `$tabht`, `$tabtva`, ...) instead of the normalized
-`$journal_data` structure `getData()` produces for `variousjournal.php`. Two gaps to carry
-through the extraction, not silently drop:
-- A "replaced invoice" skip branch (`sellsjournal.php:534-548`) with **no equivalent** in
-  `writeIntoBookkeeping()` or its `getData()` — an invoice whose `close_code ==
-  Facture::CLOSECODE_REPLACED` and isn't yet in the bookkeeping is skipped entirely before any
-  rows are built for it. This needs to live in a `getData()`-equivalent data-prep step (e.g. an
-  `element['skip']` flag), not inside the write method itself.
-- `writeIntoBookkeeping()` fires an `accountingjournaldao`/`writeBookkeeping` hook
-  (`accountingjournal.class.php:1461-1468`) before doing anything; the inline `sellsjournal.php`
-  write block (lines 497-921) has **no such hook call** today. Extracting the logic into a
-  shared method either introduces this hook point for sells/purchases/bank/treasury/expense
-  reports (new behavior for third-party hook consumers — flag this explicitly, don't do it
-  silently) or the extraction needs its own justification for why it's safe to add.
+Write block (`purchasesjournal.php:444-827`, permission check present and active, no hook call):
+**4** `create()` sites — thirdparty/supplier (456-556, includes the same
+`Lettering::bookkeepingLettering()` auto-lettering side effect sells has on its own thirdparty
+block, gated `ACCOUNTING_ENABLE_LETTERING && ACCOUNTING_ENABLE_AUTOLETTERING`), product/service
+(559-629, with an `ACCOUNTING_ACCOUNT_SUPPLIER_USE_AUXILIARY_ON_DEPOSIT` subledger special case),
+VAT with reverse-charge substitution (631-729 — when the ordinary VAT amount for a line is zero
+and reverse-charge conditions hold, it substitutes `$tabrctva`/`$tabrclocaltax1`/`$tabrclocaltax2`
+for the normal `$tabtva`/`$tablocaltax1`/`$tablocaltax2` arrays entirely, using a **second**
+`AccountingAccount` cache key `accountingaccountincurrententity_vat`), and VAT-NPR counterpart
+(731-780). Same replaced-invoice skip guard as sells (480-494,
+`FactureFournisseur::CLOSECODE_REPLACED` + `getVentilExportCompta()`). Max-errors hardcoded `10`
+(→ `$max_nb_errors` param, same as the two done journals). `piece_num`/`import_key` left unset,
+same auto-derivation as every other journal — do not set them.
 
-**3.1 (remaining)** Add to `AccountingJournal`, following the expense-reports pair as the
-template (both data-collection and write loop lifted into the class, verbatim):
-```php
-public function getDataForSells(User $user, $date_start, $date_end, $in_bookkeeping = 'notyet')
-public function writeIntoBookkeepingForSells(User $user, $date_start, $date_end, $max_nb_errors = 10)
-public function getDataForPurchases(User $user, $date_start, $date_end, $in_bookkeeping = 'notyet')
-public function writeIntoBookkeepingForPurchases(User $user, $date_start, $date_end, $max_nb_errors = 10)
-public function getDataForBank(User $user, $date_start, $date_end, $in_bookkeeping = 'notyet')          // shared by bank + treasury pages
-public function writeIntoBookkeepingForBank(User $user, $date_start, $date_end, $max_nb_errors = 10)
-```
-`sellsjournal.php`'s write block additionally fires no hook today (confirmed, same as expense
-reports) but purchases/bank haven't been checked yet for hook presence — verify before assuming
-either way, don't just copy the expense-reports "no hook" conclusion across.
+Needs `global $conf, $langs, $mysoc;` (mysoc for the reverse-charge country check — one more
+than expense reports needed, same as sells needed it for `getTaxesFromId()`). Requires
+`fourn/class/fournisseur.facture.class.php` (`FactureFournisseur`, `CLOSECODE_REPLACED`) and
+`societe/class/societe.class.php`.
 
-**3.2 (remaining)** Refactor the 4 UI pages to call the new methods — same pattern already
-proven for `expensereportsjournal.php`: the page keeps calling the data method for its own
-preview/export rendering (unpacking the return into the same local variable names it always
-used, so the ~300-line display sections need zero changes), and the write action calls the write
-method. **No accounting numbers, piece numbers, or line counts may change** — this is the
-phase's core acceptance criterion.
+Fixture: `FactureFournisseur` + line, validated (`fk_statut > 0`), line bound via
+`fk_code_ventilation` (no bind() method — same raw-SQL-update pattern as every other journal).
+Minimal config: `ACCOUNTING_ACCOUNT_SUPPLIER`, `ACCOUNTING_VAT_BUY_ACCOUNT`,
+`ACCOUNTING_PRODUCT_BUY_ACCOUNT` or `ACCOUNTING_SERVICE_BUY_ACCOUNT`, chart of accounts + fiscal
+year (same as always). Leave `vat_reverse_charge` off and NPR off for the baseline fixture to
+keep the expected math simple (3 of the 4 create sites fire: thirdparty, product, VAT) — cover
+reverse-charge and NPR in a follow-up test case once the baseline is solid, same incremental
+approach sells used for its replaced-invoice guard.
 
-**3.3 (remaining)** Extend the same `POST journals/{id}/transfer` / `GET journals/{id}/pendingdata`
-dispatch (already implemented and live for natures 1 and 5) to natures 2/3/4 as each journal's
-pair lands — same permission (`accounting->bind->write`), same `400` fallback removed once a
-nature is supported.
+#### Bank and treasury (both nature 4) — genuinely separate implementations, not a shared method
+
+**Critical finding, changes the original plan**: `bankjournal.php` and `treasuryjournal.php`
+both operate on the *same* journal row (`code='BQ'`, nature 4 — there is only one nature-4 row
+in the default `llx_accounting_journal` seed data). They are **not** two views of the same
+logic — `treasuryjournal.php` is a from-scratch 2025 rewrite (`bankjournal.php` dates to 2014),
+with a completely different data model (10 separate per-source-type SQL queries dispatched by a
+`switch`, vs. bank's single query + `get_url()`/`bank_url` link walk), different write mechanism
+(`BookKeeping::createFromValues()` vs. hand-set properties + `create()`), different balance-check
+arithmetic, and no subledger/lettering handling at all in treasury (bank sets
+`subledger_account`/fires lettering for `payment`/`payment_supplier` types; treasury never sets
+subledger_account). **Do not attempt a single shared `writeIntoBookkeepingForBank()`** — build
+two separate method pairs, e.g. `getDataForBank()`/`writeIntoBookkeepingForBank()` and
+`getDataForTreasury()`/`writeIntoBookkeepingForTreasury()`.
+
+Which one actually runs for a given install is decided at the **menu layer**, not by anything on
+the `AccountingJournal` object: `htdocs/core/menus/standard/eldy.lib.php` (~line 1803-1878)
+picks `treasuryjournal.php` when `getDolGlobalString('ACCOUNTING_MODE') == 'RECETTES-DEPENSES'`
+(cash/income-expense simplified accounting), else `bankjournal.php`. **The API's nature=4
+dispatch must replicate this same `ACCOUNTING_MODE` check** — there is no other field to key on
+since both pages target the identical journal id/code.
+
+**Bank** (`bankjournal.php`): data-collection (147-713, zero hooks in the whole file) builds
+`$tabpay`/`$tabaccount`/`$tabbq`/`$tabtp`/`$tabcompany`/`$tabuser`/`$tabtype`/`$tabmoreinfo`, one
+`db->begin()`/`commit()` per bank line. Write block (716-1084, permission check present and
+active) has only 3 physical `create()` call sites but an **11-way payment-type branch**
+(`payment`/`payment_supplier`/`payment_expensereport`/`payment_salary`/`sc`/`payment_vat`/
+`payment_donation`/`member`/`payment_loan`/`payment_various`/`banktransfert`, plus an `unknown`
+fallback to a suspense account) resolving `subledger_account`/`numero_compte` per type. **Depends
+on a page-local helper function `getSourceDocRef()` (defined at the bottom of the same file,
+lines 1607-1715) that must move into the class too** (e.g. as a private method) — it isn't safe
+to leave as a bare page-scoped function, since the extracted class method would then be
+unusable outside that page. Max-errors hardcoded `5` (not `10` like the other journals) —
+preserve that as the parameter default, don't silently harmonize to `10`.
+
+**Treasury** (`treasuryjournal.php`): permission check is commented out at the write-action `if`
+(`/* && $user->hasRight(...) */`) but this is confirmed **safe, not a real gap** — the identical
+check runs unconditionally near the top of the page (`accessforbidden()` block, same pattern as
+every other journal page) before any action dispatch happens. Data-collection (124-1131) is the
+most complex of any journal: 10 separate per-source-type SQL query/loop pairs
+(`payment`/`payment_supplier`/`payment_expensereport`/`payment_salary`/`payment_sc`/
+`payment_vat`/`payment_donation`/`payment_loan`/`payment_various`/`member`) dispatched by a
+`switch` over bank-line-linked object types, building `$tabpay`/`$tabaccount`/`$tabobject`/
+`$tabaccountingaccount`. Write block (1134-1355) is comparatively uniform (branches only on the
+sign of each object's bank-leg amount, not per-source-type — that resolution already happened
+during collection) and reads **zero** config globals directly (fully deterministic given the
+collected arrays) — but uses `BookKeeping::createFromValues()`, which pulls `global $user;`
+internally rather than taking a `$user` parameter, so passing a `User $user` param to
+`writeIntoBookkeepingForTreasury()` won't actually control which user triggers behind
+`createFromValues()`'s own trigger calls — a pre-existing footgun to note, not fix. All 4
+`createFromValues()` call sites deliberately pass `fk_docdet = 0` (not the real per-object id) —
+preserve verbatim, it's load-bearing per an inline comment about the `(fk_doc, fk_docdet)`
+uniqueness key. `$MAXNBERRORS = 5` (not `10`), same as bank.
+
+**Verification**: reuse the exact methodology proven for expense reports and sells — seed a
+fixture, capture a golden baseline by running the **unmodified** page's inline logic (copied
+verbatim into a throwaway script; the real page can't be driven from a bare CLI script since it
+requires `main.inc.php`'s full login flow, no `NOLOGIN` bypass), refactor, reseed identically,
+re-run via both the new page and the new class method alone, diff byte-for-byte against the
+baseline, and check idempotency. Add `test/phpunit/AccountingJournal<Name>TransferTest.php` per
+journal, following `AccountingJournalSellsTransferTest.php`'s structure (2 test methods: the
+main golden-baseline flow, and one targeted edge-case test — e.g. purchases' reverse-charge
+substitution or NPR counterpart, matching how sells got a dedicated replaced-invoice test).
 
 **Explicit risk flag**: this is a behavior-preserving refactor of live production financial
-logic, not new logic. Any output deviation (account numbers, piece numbering, rounding,
-dropped edge cases like the sells-journal replaced-invoice/retained-warranty branches near
-`sellsjournal.php:534-548`) is a regression, not an improvement.
+logic, not new logic. Any output deviation is a regression, not an improvement.
 
-**Verification**: reuse the exact methodology proven for expense reports above — seed a fixture,
-capture a golden baseline by running the **unmodified** page's inline logic (copied verbatim
-into a throwaway script; the real page can't be driven from a bare CLI script since it requires
-`main.inc.php`'s full login flow, no `NOLOGIN` bypass), refactor, reseed identically, re-run via
-both the new page and the new class method alone, diff byte-for-byte against the baseline, and
-check idempotency. Add `test/phpunit/AccountingJournal<Name>TransferTest.php` per journal,
-following `AccountingJournalExpenseReportsTransferTest.php`'s structure — explicitly including
-the edge-case branches visible in the current inline code (e.g. sells-journal
-replaced-invoice/retained-warranty handling) so a careless extraction can't silently drop them.
+**Process note, learned the hard way on sells**: run **phpstan** (not just parallel-lint/phpcs)
+on both the modified `AccountingJournal` class and the refactored page after every extraction,
+before considering it done. The sells extraction initially dropped a page-local `$error++`
+(inside data-collection's too-many-lines guard) that the page's write-action gate depended on —
+lint/phpcs/the golden-baseline test with normal-sized fixtures all stayed green, but phpstan's
+"condition is always true" finding on the write gate's `if` surfaced the gap immediately. This
+class of bug (an error/state flag that used to flow implicitly through shared page scope, now
+needing to be threaded explicitly through a method's return value) is exactly the kind of thing
+a small fixture won't exercise but phpstan's control-flow analysis catches for free — treat it as
+a required step, not an optional extra, for purchases/bank/treasury too.
 
 ## Phase 4 — Close accounting period (step E) — Implemented
 
