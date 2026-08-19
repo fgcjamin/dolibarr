@@ -166,8 +166,67 @@ its own new fiscal year, must `unset($conf->cache['active_fiscal_period_cached']
 creating each new `Fiscalyear`, or a later test method's period is invisible to
 `BookKeeping::create()`'s date check even though the row exists in the DB (this silently didn't
 bite the purchases/sells tests only because their second test method's fixture — a replaced
-invoice — returns before ever calling `BookKeeping::create()`). Treasury remains the sole open
-item — see the rewritten Phase 3b section below.
+invoice — returns before ever calling `BookKeeping::create()`).
+
+Phase 3b, fifth slice (treasury journal transfer, `RECETTES-DEPENSES` accounting mode) has been
+implemented — see `AccountingJournal::getDataForTreasury()`/`writeIntoBookkeepingForTreasury()`
+in `htdocs/accountancy/class/accountingjournal.class.php`, a verbatim lift of
+`treasuryjournal.php`'s former inline data-collection (10 per-source-type SQL query/loop pairs —
+`payment`/`payment_supplier`/`payment_expensereport`/`payment_salary`/`payment_sc`/`payment_vat`/
+`payment_donation`/`payment_loan`/`payment_various`/`member`, plus `banktransfert`, dispatched by
+a `switch` over bank-line-linked object types; zero hooks, confirmed the whole file fires none)
+and write loop (per-payment/per-object double-entry: a bank-side row, then one row per bound
+"operation" account, then one row per VAT bucket, balanced via a running `$total_check`). Wired
+into `POST journals/{id}/transfer`/`GET journals/{id}/pendingdata` as the `RECETTES-DEPENSES`
+branch of nature `4` — the `501` this backlog previously documented for that combination is gone;
+`ACCOUNTING_MODE` now cleanly dispatches to `writeIntoBookkeepingForBank()`/`getDataForBank()` or
+`writeIntoBookkeepingForTreasury()`/`getDataForTreasury()` on the exact same journal row, matching
+`eldy.lib.php`'s own page-selection check. This closes out Phase 3b — **all 5 journal natures are
+now transfer-able via the API.**
+
+Two adaptations, neither a behavior change:
+1. The original page defined a page-scoped named function `payment_filter()` (used to
+   `array_filter()` out payments with no matched objects). A named `function` declaration can't
+   safely live inside a class method body — it would fatal with "Cannot redeclare
+   `payment_filter()`" the second time `getDataForTreasury()` (or
+   `writeIntoBookkeepingForTreasury()`, which calls it once more internally) runs in the same PHP
+   process, e.g. `transfer()` and `pendingData()` both called from one script or phpunit run.
+   Replaced with an equivalent inline closure — same filter condition, same result.
+2. The write block's `$MAXNBERRORS = 5` was reassigned a second time (to the exact same literal)
+   inside the per-payment rollback branch — a pure no-op in the original page, which had no way to
+   parametrize it anyway. Threading a real `$max_nb_errors` parameter through (to match every
+   sibling `writeIntoBookkeepingForXxx()`) while keeping that second assignment would have turned
+   the no-op into a real behavior change — silently clobbering a caller-supplied non-default
+   threshold back down to 5 after the first rolled-back payment — so it was dropped instead of
+   "preserved".
+
+Also confirmed and preserved verbatim: unlike bank, treasury's `operations` bookkeeping rows book
+directly against the invoice/report/etc. line's own bound accounting account
+(`fd.fk_code_ventilation` et al.), never through a customer/supplier subledger — there is no
+subledger or lettering handling anywhere in treasury's write logic, confirmed while scoping this
+slice originally (see the "Bank and treasury" subsection below) and reconfirmed by this
+extraction finding no `subledger_account` assignment anywhere in the lifted write block.
+
+Verified against a golden pre-refactor baseline (byte-for-byte match on `numero_compte`/`debit`/
+`credit` for a 0%-VAT `payment`-type customer payment, via both the page's own call sequence and
+the class methods alone — 0% VAT was chosen so the fixture doesn't need VAT-rate accounting-code
+dictionary data seeded, the same simplification purchases' baseline used for reverse-charge/NPR),
+idempotency, and a second fixture exercising the structurally distinct `payment_various` branch
+(direct `accountancy_code` key, no invoice/thirdparty/binding at all). Test coverage in
+`test/phpunit/AccountingJournalTreasuryTransferTest.php`. **Two testing-environment gotchas worth
+keeping for the next phpunit work in this repo**:
+1. A worktree checkout needs its own `htdocs/conf/conf.php` (gitignored, not shared with the main
+   checkout) with `$dolibarr_main_document_root` pointed at *that worktree's* `htdocs`, not the
+   main checkout's. Copying `conf.php` verbatim from the main checkout and running phpunit from
+   inside the worktree causes `master.inc.php` to resolve `DOL_DOCUMENT_ROOT` to the main
+   checkout's `htdocs`, while the test file's own `require_once dirname(__FILE__).'/../../htdocs/
+   ...'` resolves to the worktree's `htdocs` — two different real paths for the same class, giving
+   a "Cannot declare class X, because the name is already in use" fatal that looks like a code bug
+   but is purely a stale-`conf.php` path mismatch.
+2. `PaymentVarious::create()` links the new bank line via `update_fk_bank()`, which `UPDATE`s the
+   `fk_bank` column in the DB but does **not** set `$this->fk_bank` on the in-memory object — a
+   test needs `->fetch($id)` again after `create()` before reading `->fk_bank`, or it reads back a
+   stale `0`.
 
 This backlog covers the remaining phases needed for the accountancy module's REST API to
 fully drive the module end to end (recurring operations: binding, ledger transfer, closure,
@@ -309,13 +368,13 @@ why: it doesn't touch the `DolibarrApi` autoloader chain that breaks under this 
 scratch phpunit install). Live smoke tests for the two new endpoints (nature 1 and nature 5, plus
 the `400` for an unsupported nature) also passed.
 
-### Phase 3b, remaining slice — bank, treasury
+### Phase 3b, bank and treasury slices — Implemented (original scoping kept below, historical)
 
-**This is still the genuinely risky part of Phase 3.** The 2 largest, most special-case-laden
-journal pages are untouched. Sells, expense reports, and purchases are all done now (see status
-paragraphs above) and between them fully validate the extraction pattern below, including a real
-bug the pattern's own verification caught (see the phpstan note at the end of this section) —
-treat that as required reading before starting the next journal, not optional context.
+Both slices are now done — see the status paragraphs near the top of this file. The 2 largest,
+most special-case-laden journal pages were the genuinely risky part of Phase 3; the rest of this
+section is the original pre-implementation scoping, kept as historical context since the analysis
+held up (including a real bug the pattern's own verification caught — see the phpstan note at the
+end of this section, doubly proven by both the bank and treasury extractions).
 
 **Correction to the original assumption, now proven twice**: the backlog originally assumed each
 journal's write logic could be extracted with a simple `($user, $date_start, $date_end)`
@@ -346,12 +405,10 @@ convention every extracted `writeIntoBookkeepingForXxx()` mirrors.
 
 `AccountingJournal::getLibType()` is a **label-only** dispatch (`$nature` → translated string),
 not a functional dispatch. The API's nature-based dispatch (`AccountingJournals::transfer()`/
-`pendingData()` in `htdocs/accountancy/class/api_accountingjournals.class.php`) currently
-supports natures `1` (various), `2` (sells), `3` (purchases), `4` (bank — only when
-`ACCOUNTING_MODE != 'RECETTES-DEPENSES'`, a `501` otherwise), and `5` (expense reports). Treasury
-(nature `4` in `RECETTES-DEPENSES` mode) is the only case still returning the generic
-not-yet-implemented response — its own `getDataForTreasury()`/`writeIntoBookkeepingForTreasury()`
-pair doesn't exist yet, see below.
+`pendingData()` in `htdocs/accountancy/class/api_accountingjournals.class.php`) supports natures
+`1` (various), `2` (sells), `3` (purchases), `4` (bank when `ACCOUNTING_MODE != 'RECETTES-
+DEPENSES'`, treasury when it does equal `'RECETTES-DEPENSES'`), and `5` (expense reports) — all 5
+natures are now transfer-able via the API, closing out Phase 3b.
 
 | Journal | Page | Inline block lines | Approx. size | Status |
 |---|---|---|---|---|
@@ -359,7 +416,7 @@ pair doesn't exist yet, see below.
 | Expense reports | `expensereportsjournal.php` | 276-542 (pre-refactor) | ~265 lines | **Done** |
 | Purchases | `purchasesjournal.php` | 444-827 | ~385 lines | **Done** |
 | Bank | `bankjournal.php` | 716-1084 | ~370 lines | **Done** (non-`RECETTES-DEPENSES` mode) |
-| Treasury | `treasuryjournal.php` | 1134-1355 | ~220 lines | Remaining |
+| Treasury | `treasuryjournal.php` | 1134-1355 | ~220 lines | **Done** (`RECETTES-DEPENSES` mode) |
 
 #### Purchases (nature 3) — Implemented (kept as reference for the bank/treasury extractions below)
 
@@ -405,12 +462,13 @@ approach sells used for its replaced-invoice guard.
 
 #### Bank and treasury (both nature 4) — genuinely separate implementations, not a shared method
 
-**Bank is now Implemented** — see the status paragraph near the top of this file for exactly what
-shipped (`getDataForBank()`/`writeIntoBookkeepingForBank()`/`getSourceDocRefForBank()` on
-`AccountingJournal`, wired into nature `4` on the API's `transfer()`/`pendingData()` gated by
-`ACCOUNTING_MODE`, two real bugs caught and fixed, golden-baseline + phpunit coverage). Everything
-below in this section was written *before* that slice and remains accurate for **treasury only**
-— read it as "what treasury still needs," not as still-open work for bank.
+**Both bank and treasury are now Implemented** — see the status paragraphs near the top of this
+file for exactly what shipped in each slice (`getDataForBank()`/`writeIntoBookkeepingForBank()`/
+`getSourceDocRefForBank()` and `getDataForTreasury()`/`writeIntoBookkeepingForTreasury()` on
+`AccountingJournal`, both wired into nature `4` on the API's `transfer()`/`pendingData()`,
+dispatched between each other by `ACCOUNTING_MODE`). Everything below in this section was written
+*before* either slice and is kept as historical scoping context — the analysis held up, but treat
+the status paragraphs above as authoritative for what actually shipped.
 
 **Critical finding, changes the original plan**: `bankjournal.php` and `treasuryjournal.php`
 both operate on the *same* journal row (`code='BQ'`, nature 4 — there is only one nature-4 row
