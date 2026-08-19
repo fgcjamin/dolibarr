@@ -225,19 +225,16 @@ if ($massaction == 'ventil' && $user->hasRight('accounting', 'bind', 'write')) {
 				$msg .= '<div><span class="error">'.$langs->trans("Lineofinvoice").' '.$monId.' - '.$langs->trans("NoAccountSelected").'</span></div>';
 				$ko++;
 			} else {
-				$sql = " UPDATE ".MAIN_DB_PREFIX."facture_fourn_det";
-				$sql .= " SET fk_code_ventilation = ".((int) $monCompte);
-				$sql .= " WHERE rowid = ".((int) $monId);
-
 				$accountventilated = new AccountingAccount($db);
 				$accountventilated->fetch($monCompte, '', 1);
 
-				dol_syslog('accountancy/supplier/list.php', LOG_DEBUG);
-				if ($db->query($sql)) {
+				$accountingaccount = new AccountingAccount($db);
+				$result = $accountingaccount->bindInvoiceLine($monId, $monCompte, 'supplier', $user);
+				if ($result > 0) {
 					$msg .= '<div><span class="green">'.$langs->trans("Lineofinvoice").' '.$monId.' - '.$langs->trans("VentilatedinAccount").' : '.length_accountg($accountventilated->account_number).'</span></div>';
 					$ok++;
 				} else {
-					$msg .= '<div><span class="error">'.$langs->trans("ErrorDB").' : '.$langs->trans("Lineofinvoice").' '.$monId.' - '.$langs->trans("NotVentilatedinAccount").' : '.length_accountg($accountventilated->account_number).'<br> <pre>'.$sql.'</pre></span></div>';
+					$msg .= '<div><span class="error">'.$langs->trans("ErrorDB").' : '.$langs->trans("Lineofinvoice").' '.$monId.' - '.$langs->trans("NotVentilatedinAccount").' : '.length_accountg($accountventilated->account_number).'<br> <pre>'.dol_escape_htmltag($accountingaccount->error).'</pre></span></div>';
 					$ko++;
 				}
 			}

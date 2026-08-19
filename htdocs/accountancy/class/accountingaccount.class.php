@@ -687,6 +687,67 @@ class AccountingAccount extends CommonObject
 	}
 
 	/**
+	 * Bind (or rebind) an invoice line to an accounting account. Passing an $accountid <= 0
+	 * unbinds the line (sets fk_code_ventilation back to 0).
+	 *
+	 * @param 	int 		$lineid 	Id of invoice line (facturedet or facture_fourn_det)
+	 * @param 	int 		$accountid 	Id of accounting account to bind to, or <=0 to unbind
+	 * @param 	string 		$type 		'customer' or 'supplier'
+	 * @param 	?User 		$user 		Object user making the change (unused today, kept for signature/trigger consistency)
+	 * @param 	int 		$notrigger 	1=Disable triggers (reserved, no trigger event exists yet for this action)
+	 * @return 	int 					Return integer >0 if OK, <0 if KO
+	 */
+	public function bindInvoiceLine($lineid, $accountid, $type = 'customer', User $user = null, $notrigger = 0)
+	{
+		$tablebytype = array(
+			'customer' => 'facturedet',
+			'supplier' => 'facture_fourn_det',
+		);
+
+		if (!isset($tablebytype[$type])) {
+			$this->error = "ErrorBadParameterType";
+			$this->errors[] = $this->error;
+			return -1;
+		}
+
+		if ($accountid < 0) {
+			$accountid = 0;
+		}
+
+		$sql = "UPDATE ".$this->db->prefix().$tablebytype[$type];
+		$sql .= " SET fk_code_ventilation = ".((int) $accountid);
+		$sql .= " WHERE rowid = ".((int) $lineid);
+
+		$this->db->begin();
+
+		dol_syslog(get_class($this)."::bindInvoiceLine", LOG_DEBUG);
+		$result = $this->db->query($sql);
+		if ($result) {
+			$this->db->commit();
+			return 1;
+		} else {
+			$this->error = $this->db->lasterror();
+			$this->errors[] = $this->error;
+			$this->db->rollback();
+			return -1;
+		}
+	}
+
+	/**
+	 * Unbind an invoice line from its accounting account (sets fk_code_ventilation back to 0).
+	 *
+	 * @param 	int 		$lineid 	Id of invoice line (facturedet or facture_fourn_det)
+	 * @param 	string 		$type 		'customer' or 'supplier'
+	 * @param 	?User 		$user 		Object user making the change (unused today, kept for signature/trigger consistency)
+	 * @param 	int 		$notrigger 	1=Disable triggers (reserved, no trigger event exists yet for this action)
+	 * @return 	int 					Return integer >0 if OK, <0 if KO
+	 */
+	public function unbindInvoiceLine($lineid, $type = 'customer', User $user = null, $notrigger = 0)
+	{
+		return $this->bindInvoiceLine($lineid, 0, $type, $user, $notrigger);
+	}
+
+	/**
 	 *  Return the label of the status
 	 *
 	 *  @param  int		$mode          0=long label, 1=short label, 2=Picto + short label, 3=Picto, 4=Picto + long label, 5=Short label + Picto, 6=Long label + Picto

@@ -31,6 +31,7 @@ require '../../main.inc.php';
 
 require_once DOL_DOCUMENT_ROOT.'/fourn/class/fournisseur.facture.class.php';
 require_once DOL_DOCUMENT_ROOT.'/core/class/html.formaccounting.class.php';
+require_once DOL_DOCUMENT_ROOT.'/accountancy/class/accountingaccount.class.php';
 
 /**
  * @var Conf $conf
@@ -68,17 +69,10 @@ if (!$user->hasRight('accounting', 'bind', 'write')) {
 
 if ($action == 'ventil' && $user->hasRight('accounting', 'bind', 'write')) {
 	if (!$cancel) {
-		if ($codeventil < 0) {
-			$codeventil = 0;
-		}
-
-		$sql = " UPDATE ".MAIN_DB_PREFIX."facture_fourn_det";
-		$sql .= " SET fk_code_ventilation = ".((int) $codeventil);
-		$sql .= " WHERE rowid = ".((int) $id);
-
-		$resql = $db->query($sql);
-		if (!$resql) {
-			setEventMessages($db->lasterror(), null, 'errors');
+		$accountingaccount = new AccountingAccount($db);
+		$result = $accountingaccount->bindInvoiceLine($id, $codeventil, 'supplier', $user);
+		if ($result <= 0) {
+			setEventMessages($accountingaccount->error, null, 'errors');
 		} else {
 			setEventMessages($langs->trans("RecordModifiedSuccessfully"), null, 'mesgs');
 			if ($backtopage) {
