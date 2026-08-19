@@ -46,8 +46,8 @@ via the already-correct `getData()`/`writeIntoBookkeeping()`, `5` via the new ex
 methods, anything else `400`), and the `BookKeeping::create()` return-value fix in
 `htdocs/accountancy/class/bookkeeping.class.php` (audited all 12 production call sites first —
 all safe). Test coverage in `test/phpunit/AccountingJournalExpenseReportsTransferTest.php` and
-the corrected assertion in `test/phpunit/BookKeepingTest.php::testBookKeepingCreate()`. Purchases,
-bank, and treasury remain open — see the rewritten Phase 3b section below.
+the corrected assertion in `test/phpunit/BookKeepingTest.php::testBookKeepingCreate()`. Sells,
+purchases, bank, and treasury remain open at this point — see the rewritten Phase 3b section below.
 
 Phase 3b, second slice (sells journal transfer) has been implemented — see
 `AccountingJournal::getDataForSells()`/`writeIntoBookkeepingForSells()` in
@@ -69,8 +69,34 @@ data instead of being blocked like the original. Fixed by threading an `'error'`
 phpstan "always true" finding on the write-action's `if` condition surfaced the gap — worth
 re-running phpstan after any future journal extraction, not just lint/phpcs, for exactly this
 class of subtle omission). Test coverage in
-`test/phpunit/AccountingJournalSellsTransferTest.php`. Purchases, bank, and treasury remain
-open — see the rewritten Phase 3b section below.
+`test/phpunit/AccountingJournalSellsTransferTest.php`. Purchases, bank, and treasury remained
+open at this point — see the rewritten Phase 3b section below.
+
+Phase 3b, third slice (purchases journal transfer) has been implemented — see
+`AccountingJournal::getDataForPurchases()`/`writeIntoBookkeepingForPurchases()` in
+`htdocs/accountancy/class/accountingjournal.class.php`, a verbatim lift of
+`purchasesjournal.php`'s former inline data-collection (4 hook points: `doActions`,
+`printFieldListSelect`/`From`/`Where` — this journal has no `processingJournalData`/
+`processedJournalData` hooks, unlike sells) and write loop (4 `create()` sites: thirdparty with
+an auto-lettering side effect, product/service, VAT with a reverse-charge substitution branch,
+VAT-NPR counterpart; plus the replaced-invoice skip guard). Wired into
+`POST journals/{id}/transfer`/`GET journals/{id}/pendingdata` as nature `3`. `getDataForPurchases()`'s
+return shape is a genuine superset+subset mismatch with `getDataForSells()`'s, not a copy: no
+`tabwarranty`/`tabrevenuestamp`, but adds purchases-specific `tabother` (VAT-NPR counterpart) and
+`tabrctva`/`tabrclocaltax1`/`tabrclocaltax2` (VAT reverse-charge) — none of these three are
+pre-zero-initialized for every invoice the way `tabtva`/`tablocaltax1`/`tablocaltax2` are, so the
+original code's `isset()`/`is_array()` guards around them were preserved verbatim in the lift
+rather than "cleaned up." `writeIntoBookkeepingForPurchases()` needs `$mysoc` in the *write* half
+too (the VAT-substitution branch re-checks `$mysoc->country_code`), unlike sells' write method
+which only needed it during data-collection. Verified against a golden pre-refactor baseline
+(byte-for-byte match on `numero_compte`/`debit`/`credit` across all 3 rows, via both the page's
+own call sequence and the class methods alone), a direct API smoke test of both new
+`transfer()`/`pendingData()` branches, and idempotency. Test coverage in
+`test/phpunit/AccountingJournalPurchasesTransferTest.php` (baseline write + replaced-invoice
+skip, mirroring the sells test structure) — reverse-charge substitution and the VAT-NPR
+counterpart are deliberately left as **follow-up** test cases, not covered by this slice's
+fixture (which has both switched off to keep the expected math simple: only 3 of the 4 create
+sites fire). Bank and treasury remain open — see the rewritten Phase 3b section below.
 
 This backlog covers the remaining phases needed for the accountancy module's REST API to
 fully drive the module end to end (recurring operations: binding, ledger transfer, closure,
@@ -212,13 +238,13 @@ why: it doesn't touch the `DolibarrApi` autoloader chain that breaks under this 
 scratch phpunit install). Live smoke tests for the two new endpoints (nature 1 and nature 5, plus
 the `400` for an unsupported nature) also passed.
 
-### Phase 3b, remaining slice — purchases, bank, treasury
+### Phase 3b, remaining slice — bank, treasury
 
-**This is still the genuinely risky part of Phase 3.** The 3 largest, most special-case-laden
-journal pages are untouched. Sells and expense reports are both done now (see status paragraphs
-above) and between them fully validate the extraction pattern below, including a real bug the
-pattern's own verification caught (see the phpstan note at the end of this section) — treat that
-as required reading before starting the next journal, not optional context.
+**This is still the genuinely risky part of Phase 3.** The 2 largest, most special-case-laden
+journal pages are untouched. Sells, expense reports, and purchases are all done now (see status
+paragraphs above) and between them fully validate the extraction pattern below, including a real
+bug the pattern's own verification caught (see the phpstan note at the end of this section) —
+treat that as required reading before starting the next journal, not optional context.
 
 **Correction to the original assumption, now proven twice**: the backlog originally assumed each
 journal's write logic could be extracted with a simple `($user, $date_start, $date_end)`
@@ -227,7 +253,7 @@ signature by redoing a generic date-range query inside the class, the way
 actually holds for `variousjournal.php` (nature 1). Every other journal has its own bespoke,
 often hook-coupled data-collection SQL and per-journal keying convention (flat
 `$tabht`/`$tabtva`/`$tabttc`-style arrays, not the generic `blocks` structure
-`writeIntoBookkeeping()` expects). So each of purchases/bank/treasury needs its own
+`writeIntoBookkeeping()` expects). So each of bank/treasury (like purchases before them) needs its own
 `getDataForXxx()` + `writeIntoBookkeepingForXxx()` pair, following the exact pattern established
 for expense reports and sells (lift **both** the data-collection query and the write loop into
 the class, verbatim, so the pair is self-contained and API-callable) — not a smaller "just
@@ -250,19 +276,19 @@ convention every extracted `writeIntoBookkeepingForXxx()` mirrors.
 `AccountingJournal::getLibType()` is a **label-only** dispatch (`$nature` → translated string),
 not a functional dispatch. The API's nature-based dispatch (`AccountingJournals::transfer()`/
 `pendingData()` in `htdocs/accountancy/class/api_accountingjournals.class.php`) currently
-supports natures `1` (various) and `2` (sells); `3` (purchases) and `5` (expense reports) are
-the next straightforward additions — but **nature `4` (bank/treasury) needs special handling,
-not a simple `elseif`**, see below.
+supports natures `1` (various), `2` (sells), `3` (purchases), and `5` (expense reports) — only
+nature `4` (bank/treasury) remains, and it **needs special handling, not a simple `elseif`**, see
+below.
 
 | Journal | Page | Inline block lines | Approx. size | Status |
 |---|---|---|---|---|
 | Sales | `sellsjournal.php` | 496-921 (pre-refactor) | ~425 lines | **Done** |
 | Expense reports | `expensereportsjournal.php` | 276-542 (pre-refactor) | ~265 lines | **Done** |
-| Purchases | `purchasesjournal.php` | 444-827 | ~385 lines | Remaining |
+| Purchases | `purchasesjournal.php` | 444-827 | ~385 lines | **Done** |
 | Bank | `bankjournal.php` | 716-1084 | ~370 lines | Remaining |
 | Treasury | `treasuryjournal.php` | 1134-1355 | ~220 lines | Remaining |
 
-#### Purchases (nature 3)
+#### Purchases (nature 3) — Implemented (kept as reference for the bank/treasury extractions below)
 
 Data-collection (`purchasesjournal.php:142-442`): one main query (hooks `printFieldListSelect`/
 `From`/`Where`, context `purchasesjournal`) against `facture_fourn_det`, plus a second
