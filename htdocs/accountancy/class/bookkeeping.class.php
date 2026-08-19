@@ -460,7 +460,7 @@ class BookKeeping extends CommonObject
 
 					if ($id > 0) {
 						$this->id = $id;
-						$result = 0;
+						$result = $id;
 					} else {
 						$result = -2;
 						$error++;
@@ -488,8 +488,8 @@ class BookKeeping extends CommonObject
 
 		// Call triggers
 		if (! $error && ! $notrigger) {
-			$result = $this->call_trigger('BOOKKEEPING_CREATE', $user);
-			if ($result < 0) {
+			$triggerResult = $this->call_trigger('BOOKKEEPING_CREATE', $user);
+			if ($triggerResult < 0) {
 				$error++;
 			}
 		}

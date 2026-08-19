@@ -69,7 +69,7 @@ class BookKeepingTest extends CommonClassTest
 		$result = $localobject->create($user);
 
 		print __METHOD__." result=".$result." id=".$localobject->id."\n";
-		$this->assertLessThan($result, 0, $localobject->errorsToString());
+		$this->assertGreaterThan(0, $result, $localobject->errorsToString());
 		return $localobject->id;
 	}
 

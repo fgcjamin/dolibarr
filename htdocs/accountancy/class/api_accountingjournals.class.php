@@ -278,6 +278,118 @@ class AccountingJournals extends DolibarrApi
 	}
 
 	/**
+	 * Write pending accounting movements for a journal into the general ledger.
+	 *
+	 * Supported journal natures: 1 (various operations, wraps AccountingJournal::getData()+
+	 * writeIntoBookkeeping()) and 5 (expense reports, wraps AccountingJournal::
+	 * writeIntoBookkeepingForExpenseReports()). Other natures are not yet implemented via API -
+	 * see roadmap/backlog.md Phase 3b.
+	 *
+	 * @param	int		$id				Accounting journal ID
+	 * @param	array	$request_data	Request data
+	 * @phan-param array{date_start?:int,date_end?:int} $request_data
+	 * @phpstan-param array{date_start?:int,date_end?:int} $request_data
+	 * @return	array
+	 * @phan-return array{success:bool,nb_errors:int}
+	 * @phpstan-return array{success:bool,nb_errors:int}
+	 *
+	 * @url		POST journals/{id}/transfer
+	 *
+	 * @throws	RestException	400	Bad parameters, or transfer not implemented for this journal's nature
+	 * @throws	RestException	403	Insufficient rights
+	 * @throws	RestException	404	Accounting journal not found
+	 */
+	public function transfer($id, $request_data = null)
+	{
+		if (!DolibarrApiAccess::$user->hasRight('accounting', 'bind', 'write')) {
+			throw new RestException(403, 'No permission to transfer accounting movements');
+		}
+
+		$journal = new AccountingJournal($this->db);
+		$result = $journal->fetch($id);
+		if (!$result) {
+			throw new RestException(404, 'Accounting journal not found');
+		}
+
+		$date_start = !empty($request_data['date_start']) ? (int) $request_data['date_start'] : 0;
+		$date_end = !empty($request_data['date_end']) ? (int) $request_data['date_end'] : 0;
+		if (empty($date_start) || empty($date_end)) {
+			throw new RestException(400, 'date_start and date_end are mandatory');
+		}
+
+		if ((int) $journal->nature === 1) {
+			$journal_data = $journal->getData(DolibarrApiAccess::$user, 'bookkeeping', $date_start, $date_end, 'notyet');
+			$result = $journal->writeIntoBookkeeping(DolibarrApiAccess::$user, $journal_data);
+		} elseif ((int) $journal->nature === 5) {
+			$result = $journal->writeIntoBookkeepingForExpenseReports(DolibarrApiAccess::$user, $date_start, $date_end);
+		} else {
+			throw new RestException(400, 'Transfer via API is not yet implemented for this journal type (nature '.$journal->nature.'); see roadmap/backlog.md Phase 3b');
+		}
+
+		return array(
+			'success' => $result >= 0,
+			'nb_errors' => $result < 0 ? abs($result) : 0,
+		);
+	}
+
+	/**
+	 * Preview pending (not-yet-journalized) accounting movements for a journal, without writing.
+	 *
+	 * Kept deliberately simple: a list of pending documents and whether each already carries an
+	 * error flag, not a full trial-balance preview (computing debit/credit subtotals without
+	 * writing would mean re-deriving the write loop's math a second time).
+	 *
+	 * @param	int		$id				Accounting journal ID
+	 * @param	int		$date_start		Start date (timestamp)
+	 * @param	int		$date_end		End date (timestamp)
+	 * @return	array
+	 * @phan-return array{nb_elements:int,items:array<array{ref:string,has_error:bool}>}
+	 * @phpstan-return array{nb_elements:int,items:array<array{ref:string,has_error:bool}>}
+	 *
+	 * @url		GET journals/{id}/pendingdata
+	 *
+	 * @throws	RestException	400	Bad parameters, or preview not implemented for this journal's nature
+	 * @throws	RestException	403	Insufficient rights
+	 * @throws	RestException	404	Accounting journal not found
+	 */
+	public function pendingData($id, $date_start = 0, $date_end = 0)
+	{
+		if (!DolibarrApiAccess::$user->hasRight('accounting', 'bind', 'write') && !DolibarrApiAccess::$user->hasRight('accounting', 'mouvements', 'lire')) {
+			throw new RestException(403, 'No permission to preview accounting movements');
+		}
+
+		$journal = new AccountingJournal($this->db);
+		$result = $journal->fetch($id);
+		if (!$result) {
+			throw new RestException(404, 'Accounting journal not found');
+		}
+
+		if (empty($date_start) || empty($date_end)) {
+			throw new RestException(400, 'date_start and date_end are mandatory');
+		}
+
+		$items = array();
+		if ((int) $journal->nature === 1) {
+			$journal_data = $journal->getData(DolibarrApiAccess::$user, 'bookkeeping', (int) $date_start, (int) $date_end, 'notyet');
+			foreach ($journal_data as $element) {
+				$items[] = array('ref' => (string) (!empty($element['ref']) ? $element['ref'] : ''), 'has_error' => !empty($element['error']));
+			}
+		} elseif ((int) $journal->nature === 5) {
+			$data = $journal->getDataForExpenseReports(DolibarrApiAccess::$user, (int) $date_start, (int) $date_end, 'notyet');
+			foreach ($data['taber'] as $key => $val) {
+				$items[] = array('ref' => (string) $val['ref'], 'has_error' => !empty($data['errorforinvoice'][$key]));
+			}
+		} else {
+			throw new RestException(400, 'Preview via API is not yet implemented for this journal type (nature '.$journal->nature.'); see roadmap/backlog.md Phase 3b');
+		}
+
+		return array(
+			'nb_elements' => count($items),
+			'items' => $items,
+		);
+	}
+
+	/**
 	 * Validate fields before creating an object
 	 *
 	 * @param ?array<string,string> $data   Data to validate

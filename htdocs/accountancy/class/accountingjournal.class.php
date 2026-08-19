@@ -1574,6 +1574,451 @@ class AccountingJournal extends CommonObject
 	}
 
 	/**
+	 * Get expense report lines eligible for journalization on this (nature=5) journal.
+	 * Pure mechanical lift of accountancy/journal/expensereportsjournal.php's former inline
+	 * data-collection block (query + per-row aggregation + unbound-lines check) - must be called
+	 * on an instance already fetch()ed with the target journal id ($this->code/$this->label are
+	 * used, matching how the page used to build $journal/$journal_label from the same instance).
+	 *
+	 * @param	User	$user				User (unused directly here, kept for signature symmetry with writeIntoBookkeepingForExpenseReports())
+	 * @param	int		$date_start			Start date (timestamp)
+	 * @param	int		$date_end			End date (timestamp)
+	 * @param	string	$in_bookkeeping		'notyet' (default) or 'already'
+	 * @return	array{taber:array<int,array{date:int,ref:string,comments:string,fk_expensereportdet:int}>,tabht:array<int,array<string,float>>,tabtva:array<int,array<string,float>>,tabttc:array<int,array<string,float>>,tablocaltax1:array<int,array<string,float>>,tablocaltax2:array<int,array<string,float>>,tabuser:array<int,array{id:int,name:string,user_accountancy_code:string}>,def_tva:array<int,array<string,array<string,string>>>,errorforinvoice:array<int,string>}
+	 */
+	public function getDataForExpenseReports(User $user, $date_start, $date_end, $in_bookkeeping = 'notyet')
+	{
+		global $conf, $langs, $mysoc, $hookmanager;
+
+		require_once DOL_DOCUMENT_ROOT.'/core/lib/accounting.lib.php';
+
+		$taber = array();
+		$tabht = array();
+		$tabtva = array();
+		$def_tva = array();
+		$tabttc = array();
+		$tablocaltax1 = array();
+		$tablocaltax2 = array();
+		$tabuser = array();
+		$errorforinvoice = array();
+
+		$sql = "SELECT er.rowid, er.ref, er.date_debut as de, er.date_fin as df,";
+		$sql .= " erd.rowid as erdid, erd.comments, erd.total_ht, erd.total_tva, erd.total_localtax1, erd.total_localtax2, erd.tva_tx, erd.total_ttc, erd.fk_code_ventilation, erd.vat_src_code, ";
+		$sql .= " u.rowid as uid, u.firstname, u.lastname, u.accountancy_code as user_accountancy_account,";
+		$sql .= " f.accountancy_code, aa.rowid as fk_compte, aa.account_number as compte, aa.label as label_compte";
+		$parameters = array();
+		$reshook = $hookmanager->executeHooks('printFieldListSelect', $parameters); // Note that $action and $object may have been modified by hook
+		$sql .= $hookmanager->resPrint;
+		$sql .= " FROM ".MAIN_DB_PREFIX."expensereport_det as erd";
+		$sql .= " LEFT JOIN ".MAIN_DB_PREFIX."c_type_fees as f ON f.id = erd.fk_c_type_fees";
+		$sql .= " LEFT JOIN ".MAIN_DB_PREFIX."accounting_account as aa ON aa.rowid = erd.fk_code_ventilation";
+		$sql .= " JOIN ".MAIN_DB_PREFIX."expensereport as er ON er.rowid = erd.fk_expensereport";
+		$sql .= " JOIN ".MAIN_DB_PREFIX."user as u ON u.rowid = er.fk_user_author";
+		$parameters = array();
+		$reshook = $hookmanager->executeHooks('printFieldListFrom', $parameters); // Note that $action and $object may have been modified by hook
+		$sql .= $hookmanager->resPrint;
+		$sql .= " WHERE er.fk_statut > 0";
+		$sql .= " AND erd.fk_code_ventilation > 0";
+		$sql .= " AND er.entity IN (".getEntity('expensereport', 0).")"; // We don't share object for accountancy
+		if ($date_start && $date_end) {
+			$sql .= " AND er.date_debut >= '".$this->db->idate($date_start)."' AND er.date_debut <= '".$this->db->idate($date_end)."'";
+		}
+		// Define begin binding date
+		if (getDolGlobalInt('ACCOUNTING_DATE_START_BINDING')) {
+			$sql .= " AND er.date_debut >= '".$this->db->idate(getDolGlobalInt('ACCOUNTING_DATE_START_BINDING'))."'";
+		}
+		// Already in bookkeeping or not
+		if ($in_bookkeeping == 'already') {
+			$sql .= " AND er.rowid IN (SELECT fk_doc FROM ".MAIN_DB_PREFIX."accounting_bookkeeping as ab  WHERE ab.doc_type='expense_report')";
+		}
+		if ($in_bookkeeping == 'notyet') {
+			$sql .= " AND er.rowid NOT IN (SELECT fk_doc FROM ".MAIN_DB_PREFIX."accounting_bookkeeping as ab  WHERE ab.doc_type='expense_report')";
+		}
+		$parameters = array();
+		$reshook = $hookmanager->executeHooks('printFieldListWhere', $parameters); // Note that $action and $object may have been modified by hook
+		$sql .= $hookmanager->resPrint;
+		$sql .= " ORDER BY er.date_debut";
+
+		dol_syslog('accountancy/class/accountingjournal.class.php::getDataForExpenseReports', LOG_DEBUG);
+		$result = $this->db->query($sql);
+		if ($result) {
+			$num = $this->db->num_rows($result);
+
+			// Variables
+			$account_salary = getDolGlobalString('ACCOUNTING_ACCOUNT_EXPENSEREPORT', 'NotDefined');
+			$account_vat = getDolGlobalString('ACCOUNTING_VAT_BUY_ACCOUNT', 'NotDefined');
+			$noTaxDispatchingKeepWithLines = getDolGlobalInt('ACCOUNTING_EXPENSEREPORT_DO_NOT_DISPATCH_TAXES'); //If enabled, Tax will NOT get split off from the base entry and credited to a separate tax account (good for non-VAT countries like USA)
+
+			$i = 0;
+			while ($i < $num) {
+				$obj = $this->db->fetch_object($result);
+
+				// Controls
+				$compta_user = (!empty($obj->user_accountancy_account)) ? $obj->user_accountancy_account : $account_salary;
+				$compta_fees = $obj->compte;
+
+				$vatdata = getTaxesFromId($obj->tva_tx.($obj->vat_src_code ? ' ('.$obj->vat_src_code.')' : ''), $mysoc, $mysoc, 0);
+				$compta_tva = (!empty($vatdata['accountancy_code_buy']) ? $vatdata['accountancy_code_buy'] : $account_vat);
+				$compta_localtax1 = (!empty($vatdata['accountancy_code_buy']) ? $vatdata['accountancy_code_buy'] : $account_vat);
+				$compta_localtax2 = (!empty($vatdata['accountancy_code_buy']) ? $vatdata['accountancy_code_buy'] : $account_vat);
+
+				// Define an array to display all VAT rates that use this accounting account $compta_tva
+				if (price2num($obj->tva_tx) || !empty($obj->vat_src_code)) {
+					$def_tva[$obj->rowid][$compta_tva][vatrate($obj->tva_tx).($obj->vat_src_code ? ' ('.$obj->vat_src_code.')' : '')] = (vatrate($obj->tva_tx).($obj->vat_src_code ? ' ('.$obj->vat_src_code.')' : ''));
+				}
+
+				if (getDolGlobalInt('ACCOUNTANCY_ER_DATE_RECORD')) {
+					$taber[$obj->rowid]["date"] = $this->db->jdate($obj->df);
+				} else {
+					$taber[$obj->rowid]["date"] = $this->db->jdate($obj->de);
+				}
+				$taber[$obj->rowid]["ref"] = $obj->ref;
+				$taber[$obj->rowid]["comments"] = $obj->comments;
+				$taber[$obj->rowid]["fk_expensereportdet"] = $obj->erdid;
+
+				// Avoid warnings
+				if (!isset($tabttc[$obj->rowid][$compta_user])) {
+					$tabttc[$obj->rowid][$compta_user] = 0;
+				}
+				if (!isset($tabht[$obj->rowid][$compta_fees])) {
+					$tabht[$obj->rowid][$compta_fees] = 0;
+				}
+				if (!isset($tabtva[$obj->rowid][$compta_tva])) {
+					$tabtva[$obj->rowid][$compta_tva] = 0;
+				}
+				if (!isset($tablocaltax1[$obj->rowid][$compta_localtax1])) {
+					$tablocaltax1[$obj->rowid][$compta_localtax1] = 0;
+				}
+				if (!isset($tablocaltax2[$obj->rowid][$compta_localtax2])) {
+					$tablocaltax2[$obj->rowid][$compta_localtax2] = 0;
+				}
+
+				$tabttc[$obj->rowid][$compta_user] += $obj->total_ttc;
+				if ($noTaxDispatchingKeepWithLines) { //case where all taxes paid should be grouped with the same account as the main expense (best for USA)
+					$tabht[$obj->rowid][$compta_fees] += $obj->total_ttc;
+				} else { //case where every tax paid should be broken out into its own account for future recovery (best for VAT countries)
+					$tabht[$obj->rowid][$compta_fees] += $obj->total_ht;
+					$tabtva[$obj->rowid][$compta_tva] += $obj->total_tva;
+					$tablocaltax1[$obj->rowid][$compta_localtax1] += $obj->total_localtax1;
+					$tablocaltax2[$obj->rowid][$compta_localtax2] += $obj->total_localtax2;
+				}
+				$tabuser[$obj->rowid] = array(
+						'id' => $obj->uid,
+						'name' => dolGetFirstLastname($obj->firstname, $obj->lastname),
+						'user_accountancy_code' => $obj->user_accountancy_account
+				);
+
+				$i++;
+			}
+		} else {
+			$this->errors[] = $this->db->lasterror();
+		}
+
+		// Load all unbound lines
+		if (!empty($taber)) {
+			$sql = "SELECT fk_expensereport, COUNT(erd.rowid) as nb";
+			$sql .= " FROM ".MAIN_DB_PREFIX."expensereport_det as erd";
+			$sql .= " WHERE erd.fk_code_ventilation <= 0";
+			$sql .= " AND erd.total_ttc <> 0";
+			$sql .= " AND fk_expensereport IN (".$this->db->sanitize(implode(",", array_keys($taber))).")";
+			$sql .= " GROUP BY fk_expensereport";
+			$resql = $this->db->query($sql);
+
+			$num = $this->db->num_rows($resql);
+			$i = 0;
+			while ($i < $num) {
+				$obj = $this->db->fetch_object($resql);
+				if ($obj->nb > 0) {
+					$errorforinvoice[$obj->fk_expensereport] = 'somelinesarenotbound';
+				}
+				$i++;
+			}
+		}
+
+		return array(
+			'taber' => $taber,
+			'tabht' => $tabht,
+			'tabtva' => $tabtva,
+			'tabttc' => $tabttc,
+			'tablocaltax1' => $tablocaltax1,
+			'tablocaltax2' => $tablocaltax2,
+			'tabuser' => $tabuser,
+			'def_tva' => $def_tva,
+			'errorforinvoice' => $errorforinvoice,
+		);
+	}
+
+	/**
+	 * Write the expense-reports journal (nature=5) into the bookkeeping.
+	 * Pure mechanical lift of accountancy/journal/expensereportsjournal.php's former inline
+	 * writebookkeeping action block. No hook is fired here - the original block had none, and
+	 * adding one would be new behavior (see roadmap/backlog.md Phase 3b). Must be called on an
+	 * instance already fetch()ed with the target journal id.
+	 *
+	 * @param	User	$user				User who write in the bookkeeping
+	 * @param	int		$date_start			Start date (timestamp)
+	 * @param	int		$date_end			End date (timestamp)
+	 * @param	int		$max_nb_errors		Nb errors authorized before stopping the process
+	 * @return	int							Return integer <0 if KO, >0 if OK
+	 */
+	public function writeIntoBookkeepingForExpenseReports(User $user, $date_start, $date_end, $max_nb_errors = 10)
+	{
+		global $conf, $langs;
+
+		require_once DOL_DOCUMENT_ROOT.'/accountancy/class/bookkeeping.class.php';
+		require_once DOL_DOCUMENT_ROOT.'/accountancy/class/accountingaccount.class.php';
+		require_once DOL_DOCUMENT_ROOT.'/user/class/user.class.php';
+
+		$data = $this->getDataForExpenseReports($user, $date_start, $date_end, 'notyet');
+		$taber = $data['taber'];
+		$tabht = $data['tabht'];
+		$tabtva = $data['tabtva'];
+		$tabttc = $data['tabttc'];
+		$tablocaltax1 = $data['tablocaltax1'];
+		$tablocaltax2 = $data['tablocaltax2'];
+		$tabuser = $data['tabuser'];
+		$def_tva = $data['def_tva'];
+		$errorforinvoice = $data['errorforinvoice'];
+
+		$journal = $this->code;
+		$journal_label = $this->label;
+
+		$now = dol_now();
+		$error = 0;
+
+		$userstatic = new User($this->db);
+		$bookkeepingstatic = new BookKeeping($this->db);
+
+		$accountingaccountexpense = new AccountingAccount($this->db);
+		$accountingaccountexpense->fetch(0, getDolGlobalString('ACCOUNTING_ACCOUNT_EXPENSEREPORT'), true);
+
+		foreach ($taber as $key => $val) {		// Loop on each expense report
+			$errorforline = 0;
+
+			$totalcredit = 0;
+			$totaldebit = 0;
+
+			$this->db->begin();
+
+			$userstatic->id = $tabuser[$key]['id'];
+			$userstatic->name = $tabuser[$key]['name'];
+			$userstatic->accountancy_code = $tabuser[$key]['user_accountancy_code'];
+
+			// Error if some lines are not binded/ready to be journalized
+			if (!empty($errorforinvoice[$key]) && $errorforinvoice[$key] == 'somelinesarenotbound') {
+				$error++;
+				$errorforline++;
+				setEventMessages($langs->trans('ErrorInvoiceContainsLinesNotYetBounded', $val['ref']), null, 'errors');
+			}
+
+			// Thirdparty
+			if (!$errorforline) {
+				foreach ($tabttc[$key] as $k => $mt) {
+					if ($mt) {
+						$bookkeeping = new BookKeeping($this->db);
+						$bookkeeping->doc_date = $val["date"];
+						$bookkeeping->doc_ref = $val["ref"];
+						$bookkeeping->date_creation = $now;
+						$bookkeeping->doc_type = 'expense_report';
+						$bookkeeping->fk_doc = $key;
+						$bookkeeping->fk_docdet = $val["fk_expensereportdet"];
+
+						$bookkeeping->subledger_account = $tabuser[$key]['user_accountancy_code'];
+						$bookkeeping->subledger_label = $tabuser[$key]['name'];
+
+						$bookkeeping->numero_compte = getDolGlobalString('ACCOUNTING_ACCOUNT_EXPENSEREPORT');
+						$bookkeeping->label_compte = $accountingaccountexpense->label;
+
+						$bookkeeping->label_operation = $bookkeepingstatic->accountingLabelForOperation($userstatic->name, '', $langs->trans("SubledgerAccount"));
+						$bookkeeping->montant = $mt;
+						$bookkeeping->sens = ($mt >= 0) ? 'C' : 'D';
+						$bookkeeping->debit = ($mt <= 0) ? -$mt : 0;
+						$bookkeeping->credit = ($mt > 0) ? $mt : 0;
+						$bookkeeping->code_journal = $journal;
+						$bookkeeping->journal_label = $langs->transnoentities($journal_label);
+						$bookkeeping->fk_user_author = $user->id;
+						$bookkeeping->entity = $conf->entity;
+
+						$totaldebit += $bookkeeping->debit;
+						$totalcredit += $bookkeeping->credit;
+
+						$result = $bookkeeping->create($user);
+						if ($result < 0) {
+							if ($bookkeeping->error == 'BookkeepingRecordAlreadyExists') {	// Already exists
+								$error++;
+								$errorforline++;
+								$errorforinvoice[$key] = 'alreadyjournalized';
+							} else {
+								$error++;
+								$errorforline++;
+								$errorforinvoice[$key] = 'other';
+								setEventMessages($bookkeeping->error, $bookkeeping->errors, 'errors');
+							}
+						}
+					}
+				}
+			}
+
+			// Fees
+			if (!$errorforline) {
+				foreach ($tabht[$key] as $k => $mt) {
+					if ($mt) {
+						if (empty($conf->cache['accountingaccountincurrententity'][$k])) {
+							$accountingaccount = new AccountingAccount($this->db);
+							$accountingaccount->fetch(0, $k, true);
+							$conf->cache['accountingaccountincurrententity'][$k] = $accountingaccount;
+						} else {
+							$accountingaccount = $conf->cache['accountingaccountincurrententity'][$k];
+						}
+
+						$account_label = $accountingaccount->label;
+
+						// get compte id and label
+						if ($accountingaccount->id > 0) {
+							$bookkeeping = new BookKeeping($this->db);
+							$bookkeeping->doc_date = $val["date"];
+							$bookkeeping->doc_ref = $val["ref"];
+							$bookkeeping->date_creation = $now;
+							$bookkeeping->doc_type = 'expense_report';
+							$bookkeeping->fk_doc = $key;
+							$bookkeeping->fk_docdet = $val["fk_expensereportdet"];
+
+							$bookkeeping->subledger_account = '';
+							$bookkeeping->subledger_label = '';
+
+							$bookkeeping->numero_compte = $k;
+							$bookkeeping->label_compte = $account_label;
+
+							$bookkeeping->label_operation = $bookkeepingstatic->accountingLabelForOperation($userstatic->name, '', $account_label);
+
+							$bookkeeping->montant = $mt;
+							$bookkeeping->sens = ($mt < 0) ? 'C' : 'D';
+							$bookkeeping->debit = ($mt > 0) ? $mt : 0;
+							$bookkeeping->credit = ($mt <= 0) ? -$mt : 0;
+							$bookkeeping->code_journal = $journal;
+							$bookkeeping->journal_label = $langs->transnoentities($journal_label);
+							$bookkeeping->fk_user_author = $user->id;
+							$bookkeeping->entity = $conf->entity;
+
+							$totaldebit += $bookkeeping->debit;
+							$totalcredit += $bookkeeping->credit;
+
+							$result = $bookkeeping->create($user);
+							if ($result < 0) {
+								if ($bookkeeping->error == 'BookkeepingRecordAlreadyExists') {	// Already exists
+									$error++;
+									$errorforline++;
+									$errorforinvoice[$key] = 'alreadyjournalized';
+								} else {
+									$error++;
+									$errorforline++;
+									$errorforinvoice[$key] = 'other';
+									setEventMessages($bookkeeping->error, $bookkeeping->errors, 'errors');
+								}
+							}
+						}
+					}
+				}
+			}
+
+			// VAT
+			if (!$errorforline) {
+				$listoftax = array(0, 1, 2);
+				foreach ($listoftax as $numtax) {
+					$arrayofvat = $tabtva;
+					if ($numtax == 1) {
+						$arrayofvat = $tablocaltax1;
+					}
+					if ($numtax == 2) {
+						$arrayofvat = $tablocaltax2;
+					}
+
+					foreach ($arrayofvat[$key] as $k => $mt) {
+						if ($mt) {
+							if (empty($conf->cache['accountingaccountincurrententity_vat'][$k])) {
+								$accountingaccount = new AccountingAccount($this->db);
+								$accountingaccount->fetch(0, $k, true);
+								$conf->cache['accountingaccountincurrententity_vat'][$k] = $accountingaccount;
+							} else {
+								$accountingaccount = $conf->cache['accountingaccountincurrententity_vat'][$k];
+							}
+
+							$account_label = $accountingaccount->label;
+
+							// get compte id and label
+							$bookkeeping = new BookKeeping($this->db);
+							$bookkeeping->doc_date = $val["date"];
+							$bookkeeping->doc_ref = $val["ref"];
+							$bookkeeping->date_creation = $now;
+							$bookkeeping->doc_type = 'expense_report';
+							$bookkeeping->fk_doc = $key;
+							$bookkeeping->fk_docdet = $val["fk_expensereportdet"];
+
+							$bookkeeping->subledger_account = '';
+							$bookkeeping->subledger_label = '';
+
+							$bookkeeping->numero_compte = $k;
+							$bookkeeping->label_compte = $account_label;
+
+							$tmpvatrate = (empty($def_tva[$key][$k]) ? (empty($arrayofvat[$key][$k]) ? '' : $arrayofvat[$key][$k]) : implode(', ', $def_tva[$key][$k]));
+							$labelvataccount = $langs->trans("Taxes").' '.$tmpvatrate.' %';
+							$labelvataccount .= ($numtax ? ' - Localtax '.$numtax : '');
+							$bookkeeping->label_operation = $bookkeepingstatic->accountingLabelForOperation($userstatic->name, '', $labelvataccount);
+
+							$bookkeeping->montant = $mt;
+							$bookkeeping->sens = ($mt < 0) ? 'C' : 'D';
+							$bookkeeping->debit = ($mt > 0) ? $mt : 0;
+							$bookkeeping->credit = ($mt <= 0) ? -$mt : 0;
+							$bookkeeping->code_journal = $journal;
+							$bookkeeping->journal_label = $langs->transnoentities($journal_label);
+							$bookkeeping->fk_user_author = $user->id;
+							$bookkeeping->entity = $conf->entity;
+
+							$totaldebit += $bookkeeping->debit;
+							$totalcredit += $bookkeeping->credit;
+
+							$result = $bookkeeping->create($user);
+							if ($result < 0) {
+								if ($bookkeeping->error == 'BookkeepingRecordAlreadyExists') {	// Already exists
+									$error++;
+									$errorforline++;
+									$errorforinvoice[$key] = 'alreadyjournalized';
+								} else {
+									$error++;
+									$errorforline++;
+									$errorforinvoice[$key] = 'other';
+									setEventMessages($bookkeeping->error, $bookkeeping->errors, 'errors');
+								}
+							}
+						}
+					}
+				}
+			}
+
+			// Protection against a bug on lines before
+			if (!$errorforline && (price2num($totaldebit, 'MT') != price2num($totalcredit, 'MT'))) {
+				$error++;
+				$errorforline++;
+				$errorforinvoice[$key] = 'amountsnotbalanced';
+				setEventMessages('We tried to insert a non balanced transaction in book for '.$val["ref"].'. Canceled. Surely a bug.', null, 'errors');
+			}
+
+			if (!$errorforline) {
+				$this->db->commit();
+			} else {
+				$this->db->rollback();
+
+				if ($error >= $max_nb_errors) {
+					setEventMessages($langs->trans("ErrorTooManyErrorsProcessStopped"), null, 'errors');
+					break; // Break in the foreach
+				}
+			}
+		}
+
+		return $error ? -$error : 1;
+	}
+
+	/**
 	 *	Export journal CSV
 	 * 	ISO and not UTF8 !
 	 *

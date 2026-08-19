@@ -32,8 +32,22 @@ piece-level fields stay UI-only) and both `PUT`/`DELETE` replicate the UI's own
 validated/exported guards at the API layer, since the model layer doesn't enforce them.
 `POST thirdparties/{id}/lettering` deliberately deviates from this section's original `GET`
 verb — `letteringThirdparty()` mutates data (calls `updateLettering()` internally), so `GET`
-would be unsafe. Test coverage in `test/phpunit/AccountingLedgerApiTest.php`; the write-side
-journal-transfer refactor (Phase 3b below) remains open.
+would be unsafe. Test coverage in `test/phpunit/AccountingLedgerApiTest.php`.
+
+Phase 3b (first slice: `create()` fix + expense-reports journal transfer) has been implemented —
+see `AccountingJournal::getDataForExpenseReports()`/`writeIntoBookkeepingForExpenseReports()` in
+`htdocs/accountancy/class/accountingjournal.class.php` (a mechanical, behavior-preserving
+extraction of `accountancy/journal/expensereportsjournal.php`'s former inline data-collection +
+write logic, verified against a golden pre-refactor baseline — see the Phase 3b section below
+for exact methodology), the corresponding `POST journals/{id}/transfer`/
+`GET journals/{id}/pendingdata` endpoints on `AccountingJournals`
+(`htdocs/accountancy/class/api_accountingjournals.class.php`, dispatching on journal nature: `1`
+via the already-correct `getData()`/`writeIntoBookkeeping()`, `5` via the new expense-reports
+methods, anything else `400`), and the `BookKeeping::create()` return-value fix in
+`htdocs/accountancy/class/bookkeeping.class.php` (audited all 12 production call sites first —
+all safe). Test coverage in `test/phpunit/AccountingJournalExpenseReportsTransferTest.php` and
+the corrected assertion in `test/phpunit/BookKeepingTest.php::testBookKeepingCreate()`. Sells,
+purchases, bank, and treasury remain open — see the rewritten Phase 3b section below.
 
 This backlog covers the remaining phases needed for the accountancy module's REST API to
 fully drive the module end to end (recurring operations: binding, ledger transfer, closure,
@@ -121,29 +135,79 @@ see the status paragraph near the top of this file for exactly what shipped. Not
 changed `bookkeeping.class.php`, `lettering.class.php`, `accountingjournal.class.php`, or any
 journal UI page.
 
-### Phase 3b — Journal transfer refactor — Remaining, do this next
+### Phase 3b, first slice (create() fix + expense reports) — Implemented
 
-**This is the genuinely risky part of Phase 3.** `BookKeeping::create()`,
-`AccountingJournal::writeIntoBookkeeping()`, and the 5 journal UI pages are untouched by 3a.
+`BookKeeping::create()`'s return-value bug is fixed: on success it now returns the real inserted
+row id (`$result = $id`, not `0`), and the `BOOKKEEPING_CREATE` trigger's own return value is
+captured into a separate local (`$triggerResult`) so it no longer clobbers `$result` afterward.
+Audited all 12 production call sites before making the change (`accountingjournal.class.php`,
+`bookkeeping.class.php` internals, `purchasesjournal.php`/`bankjournal.php`/`sellsjournal.php`/
+`expensereportsjournal.php`'s own remaining `create()` calls) — every one checks `< 0` for
+failure only (or `>= 0` for success, sign-based either way), none relied on the old `0`/
+trigger-return-value convention. `BookKeepingTest::testBookKeepingCreate()`'s assertion was also
+corrected (`assertGreaterThan(0, $result, ...)`, was backwards `assertLessThan($result, 0, ...)`).
 
-**Known bug to account for**: `BookKeeping::create()` (`bookkeeping.class.php`, `create()`
-method) sets `$result = 0` on a *successful* insert instead of returning the new row's id —
-confirmed live against MariaDB while verifying Phase 4, and re-confirmed while scoping 3b: the
-exact lines are `$id = $this->db->last_insert_id(...); if ($id > 0) { $this->id = $id; $result
-= 0; }`, and further down, if triggers run (`$notrigger` not set), `$result =
-$this->call_trigger('BOOKKEEPING_CREATE', $user);` **overwrites `$result` again** before the
-final `return $error ? -1 * $error : $result;`. So this is not a one-line fix — naively changing
-`$result = 0` to `$result = $id` would still get clobbered by the trigger-return-value
-reassignment whenever triggers are enabled (the common case). `$this->id` is set correctly in
-all cases; that's what every existing caller already relies on (`createFromValues()`,
-`writeIntoBookkeeping()`, `BookKeepingTest`, `AccountingClosureApiTest`). A real fix needs to
-either capture `$id` before the trigger call and restore it after (if `call_trigger()` returned
-`>= 0`), or stop overloading `$result` for two different meanings. Do this fix inside 3b's own
-behavior-preserving-refactor discipline (golden-baseline diff, not a drive-by patch), since
-`writeIntoBookkeeping()` is `create()`'s only real production caller today. Note
-`BookKeepingTest::testBookKeepingCreate()`'s current assertion (`assertLessThan($result, 0)`,
-i.e. expects `$result > 0`) is silently passing today only because the two args are backwards
-from what the name suggests — worth fixing that assertion alongside the class fix, not before.
+The expense-reports journal (nature 5, the smallest of the remaining 4 — no existing hook to
+preserve, permission check already correctly enforced unlike treasury) is now fully extracted:
+`AccountingJournal::getDataForExpenseReports()` and `::writeIntoBookkeepingForExpenseReports()`
+(`accountingjournal.class.php`) are a mechanical, verbatim lift of
+`expensereportsjournal.php`'s former inline data-collection (query + per-report aggregation +
+unbound-lines check) and write-loop (thirdparty/fees/VAT `BookKeeping` row creation, balance
+check, per-report transaction boundary) — **both stages were lifted**, not just the write loop,
+so the pair is fully self-contained and callable from the API without the page's local state
+(unlike the original backlog's assumption that only `variousjournal.php` had this shape — see
+below). The page now just unpacks `getDataForExpenseReports()`'s return into the same local
+variable names it always used, so its view/export rendering code needed zero changes.
+
+**Verification methodology used (reusable template for the remaining 4 journals)**: seeded one
+fixture expense report (`ExpenseReport::create()`/`addline()`/`setValidate()`, plus the
+accounting config prerequisites — chart of accounts, default accounts, an active fiscal year
+covering the fixture date) in the local MariaDB test DB, then ran the **unmodified**
+pre-refactor inline logic (copied verbatim into a throwaway script, since the real page requires
+`main.inc.php`'s full login/session flow and can't be driven from a bare CLI script the way
+`master.inc.php`-based smoke tests can) to snapshot the resulting `llx_accounting_bookkeeping`
+rows as a golden baseline. After the refactor, reseeded an identical fixture twice and re-ran:
+once via the page's own new call sequence (`getDataForExpenseReports()` +
+`writeIntoBookkeepingForExpenseReports()`), once via `writeIntoBookkeepingForExpenseReports()`
+alone (matching how `POST journals/{id}/transfer` calls it) — both snapshots matched the
+baseline byte-for-byte. Also verified idempotency (re-running finds nothing to do, no duplicate
+rows — the already-recorded report is excluded by `getDataForExpenseReports()`'s own `'notyet'`
+filter, same pre-existing SQL behavior, not new logic).
+
+New endpoints on `AccountingJournals`: `POST journals/{id}/transfer` `{date_start, date_end}`
+and `GET journals/{id}/pendingdata?date_start&date_end`, dispatching on `$journal->nature` (`1`
+→ the already-correct `getData()`/`writeIntoBookkeeping()`, reused as-is; `5` → the new
+expense-reports pair; anything else → explicit `400`, not a silent no-op), permission
+`accounting->bind->write` (matches every journal page's own inline gate). `pendingdata` is
+deliberately simple — a list of pending documents + an error flag per document, not a full
+trial-balance preview (computing debit/credit subtotals without writing would mean re-deriving
+the write loop's math a second time, adding risk for a preview-only feature).
+
+Test coverage: `test/phpunit/AccountingJournalExpenseReportsTransferTest.php` (runs cleanly via
+phpunit, unlike this repo's `*ApiTest.php` files — see [[project-accountancy-api-gotchas]] for
+why: it doesn't touch the `DolibarrApi` autoloader chain that breaks under this environment's
+scratch phpunit install). Live smoke tests for the two new endpoints (nature 1 and nature 5, plus
+the `400` for an unsupported nature) also passed.
+
+### Phase 3b, remaining slice — sells, purchases, bank, treasury
+
+**This is still the genuinely risky part of Phase 3.** The 4 largest, most special-case-laden
+journal pages are untouched.
+
+**Important correction to the original assumption**: the backlog originally assumed each
+journal's write logic could be extracted with a simple `($user, $date_start, $date_end)`
+signature by redoing a generic date-range query inside the class, the way
+`variousjournal.php`'s already-migrated `getData()`/`writeIntoBookkeeping()` works. Deep
+research (and the successful expense-reports extraction above) showed this only actually holds
+for `variousjournal.php` (nature 1). Every other journal — expense reports included — has its
+own bespoke, often hook-coupled data-collection SQL and per-journal keying convention (flat
+`$tabht`/`$tabtva`/`$tabttc`-style arrays, not the generic `blocks` structure
+`writeIntoBookkeeping()` expects). So each of sells/purchases/bank/treasury will need its own
+`getDataForXxx()` + `writeIntoBookkeepingForXxx()` pair, following the exact pattern established
+for expense reports above (lift **both** the data-collection query and the write loop into the
+class, verbatim, so the pair is self-contained and API-callable) — not a smaller "just extract
+the write loop, leave data-collection on the page" version, since that wouldn't support a
+REST transfer endpoint standalone.
 
 `BookKeeping` (`htdocs/accountancy/class/bookkeeping.class.php`) already has full
 CRUD/list/balance (`create`, `createFromValues`, `createStd`, `fetch*`, `update*`, `delete*`,
@@ -210,53 +274,45 @@ through the extraction, not silently drop:
   reports (new behavior for third-party hook consumers — flag this explicitly, don't do it
   silently) or the extraction needs its own justification for why it's safe to add.
 
-**3.1** Add to `AccountingJournal`, named consistently with the existing method:
+**3.1 (remaining)** Add to `AccountingJournal`, following the expense-reports pair as the
+template (both data-collection and write loop lifted into the class, verbatim):
 ```php
+public function getDataForSells(User $user, $date_start, $date_end, $in_bookkeeping = 'notyet')
 public function writeIntoBookkeepingForSells(User $user, $date_start, $date_end, $max_nb_errors = 10)
+public function getDataForPurchases(User $user, $date_start, $date_end, $in_bookkeeping = 'notyet')
 public function writeIntoBookkeepingForPurchases(User $user, $date_start, $date_end, $max_nb_errors = 10)
-public function writeIntoBookkeepingForBank(User $user, $date_start, $date_end, $max_nb_errors = 10)          // shared by bank + treasury pages
-public function writeIntoBookkeepingForExpenseReports(User $user, $date_start, $date_end, $max_nb_errors = 10)
+public function getDataForBank(User $user, $date_start, $date_end, $in_bookkeeping = 'notyet')          // shared by bank + treasury pages
+public function writeIntoBookkeepingForBank(User $user, $date_start, $date_end, $max_nb_errors = 10)
 ```
-Each is a **behavior-preserving, near-verbatim extraction** of the corresponding page's block
-(page-local `$db`/`$langs`/`$conf`/`$hookmanager` become instance/global refs the way
-`writeIntoBookkeeping()` already does — `global $conf, $langs, $hookmanager;` at line 1408).
-Preserve the existing hook pattern (`initHooks(array('accountingjournaldao'))` /
-`executeHooks('writeBookkeeping', ...)`) so third-party hooks keep working. Where a page's
-preceding `getData()`/`getAssetData()` call feeds the block, pull it in too (or accept
-`$journal_data` as a param, as `writeIntoBookkeeping()` does) — decide per journal based on
-whether the data-gathering step has UI-only concerns (e.g. pagination) that shouldn't leak
-into the reusable method.
+`sellsjournal.php`'s write block additionally fires no hook today (confirmed, same as expense
+reports) but purchases/bank haven't been checked yet for hook presence — verify before assuming
+either way, don't just copy the expense-reports "no hook" conclusion across.
 
-**3.2** Refactor the 5 UI pages to call the new methods, using the already-refactored
-`variousjournal.php` (calling `writeIntoBookkeeping()`) as the structural template. **No
-accounting numbers, piece numbers, or line counts may change** — this is the phase's core
-acceptance criterion. Do a pure cut-and-paste extraction; any subsequent cleanup is a separate,
-later change under its own review.
+**3.2 (remaining)** Refactor the 4 UI pages to call the new methods — same pattern already
+proven for `expensereportsjournal.php`: the page keeps calling the data method for its own
+preview/export rendering (unpacking the return into the same local variable names it always
+used, so the ~300-line display sections need zero changes), and the write action calls the write
+method. **No accounting numbers, piece numbers, or line counts may change** — this is the
+phase's core acceptance criterion.
 
-**3.3** New endpoints, extending `AccountingJournals`:
-
-| Endpoint | Behavior | Permission |
-|---|---|---|
-| `POST journals/{id}/transfer` `{date_start, date_end}` | Dispatches on the journal's nature (`getLibType()`) to the matching `writeIntoBookkeepingFor*()` / `writeIntoBookkeeping()` | `accounting->bind->write` (matches all 5 pages today) |
-| `GET journals/{id}/pendingdata?date_start&date_end` | Preview via `getData()`/`getAssetData()` without writing | `accounting->bind->write` or `->mouvements->lire` |
-
-Ledger CRUD + lettering endpoints on `Accountancy` are already implemented — see Phase 3a above.
+**3.3 (remaining)** Extend the same `POST journals/{id}/transfer` / `GET journals/{id}/pendingdata`
+dispatch (already implemented and live for natures 1 and 5) to natures 2/3/4 as each journal's
+pair lands — same permission (`accounting->bind->write`), same `400` fallback removed once a
+nature is supported.
 
 **Explicit risk flag**: this is a behavior-preserving refactor of live production financial
 logic, not new logic. Any output deviation (account numbers, piece numbering, rounding,
 dropped edge cases like the sells-journal replaced-invoice/retained-warranty branches near
-`sellsjournal.php:530+`) is a regression, not an improvement.
+`sellsjournal.php:534-548`) is a regression, not an improvement.
 
-**Verification** (critical, given zero current test coverage of `BookKeeping`/
-`AccountingJournal` transfer/`Lettering` — only `test/phpunit/AccountingAccountTest.php`
-exists for this module today): before refactoring each journal page, capture a golden baseline
-— run a transfer via the current UI on a seeded test dataset, snapshot resulting
-`llx_accounting_bookkeeping` rows (piece_num, accounts, debit/credit, count). After
-refactoring, re-run the same transfer via the UI (now calling the new method) on freshly
-reseeded identical data and diff — must match exactly. Then repeat once more calling only the
-new API endpoint and diff again. Add `test/phpunit/AccountingJournalTransferTest.php` covering
-each `writeIntoBookkeepingFor*()` against fixture invoices/payments/expense reports, explicitly
-including the edge-case branches visible in the current inline code (e.g. sells-journal
+**Verification**: reuse the exact methodology proven for expense reports above — seed a fixture,
+capture a golden baseline by running the **unmodified** page's inline logic (copied verbatim
+into a throwaway script; the real page can't be driven from a bare CLI script since it requires
+`main.inc.php`'s full login flow, no `NOLOGIN` bypass), refactor, reseed identically, re-run via
+both the new page and the new class method alone, diff byte-for-byte against the baseline, and
+check idempotency. Add `test/phpunit/AccountingJournal<Name>TransferTest.php` per journal,
+following `AccountingJournalExpenseReportsTransferTest.php`'s structure — explicitly including
+the edge-case branches visible in the current inline code (e.g. sells-journal
 replaced-invoice/retained-warranty handling) so a careless extraction can't silently drop them.
 
 ## Phase 4 — Close accounting period (step E) — Implemented
