@@ -41,9 +41,20 @@ class Accountancy extends DolibarrApi
 	public $bookkeeping;
 
 	/**
+	 * @var Lettering $lettering {@type Lettering}
+	 */
+	public $lettering;
+
+	/**
 	 * @var AccountancyExport $accountancyexport {@type AccountancyExport}
 	 */
 	public $accountancyexport;
+
+	/**
+	 * @var string[] Settable fields for PUT ledger/{id}, matching the "confirm_update" single-line
+	 *               edit form in accountancy/bookkeeping/card.php
+	 */
+	private static $LEDGER_SETTABLE_FIELDS = array('numero_compte', 'subledger_account', 'subledger_label', 'label_compte', 'label_operation', 'debit', 'credit');
 
 	/**
 	 * Constructor
@@ -54,12 +65,14 @@ class Accountancy extends DolibarrApi
 		$this->db = $db;
 
 		require_once DOL_DOCUMENT_ROOT.'/accountancy/class/bookkeeping.class.php';
+		require_once DOL_DOCUMENT_ROOT.'/accountancy/class/lettering.class.php';
 		require_once DOL_DOCUMENT_ROOT.'/accountancy/class/accountancyexport.class.php';
 		require_once DOL_DOCUMENT_ROOT.'/core/class/fiscalyear.class.php';
 
 		$langs->load('accountancy');
 
 		$this->bookkeeping = new BookKeeping($this->db);
+		$this->lettering = new Lettering($this->db);
 		$this->accountancyexport = new AccountancyExport($this->db);
 	}
 
@@ -453,6 +466,240 @@ class Accountancy extends DolibarrApi
 	}
 
 	/**
+	 * Get a bookkeeping (ledger) entry by ID
+	 *
+	 * @param   int     $id     Bookkeeping entry ID
+	 * @return  Object
+	 *
+	 * @url     GET ledger/{id}
+	 *
+	 * @throws  RestException  403  Insufficient rights
+	 * @throws  RestException  404  Ledger entry not found
+	 * @throws  RestException  503  Error while fetching ledger entry
+	 */
+	public function getLedgerEntry($id)
+	{
+		if (!DolibarrApiAccess::$user->hasRight('accounting', 'mouvements', 'lire')) {
+			throw new RestException(403, 'No permission to read ledger entries');
+		}
+
+		$entry = $this->_fetchLedgerEntry($id);
+
+		return $this->_cleanObjectDatas($entry);
+	}
+
+	/**
+	 * Update a bookkeeping (ledger) entry
+	 *
+	 * Only the fields editable through the single-line edit form of accountancy/bookkeeping/card.php
+	 * are settable (numero_compte, subledger_account, subledger_label, label_compte,
+	 * label_operation, debit, credit). Piece-level fields (doc_date, doc_ref, ref, code_journal)
+	 * are edited at the piece level by the UI (affecting every line sharing the same piece_num) and
+	 * are not exposed here.
+	 *
+	 * @param   int     $id             Bookkeeping entry ID
+	 * @param   array   $request_data   Request data
+	 * @phan-param ?array<string,string> $request_data
+	 * @phpstan-param ?array<string,string> $request_data
+	 * @return  Object
+	 *
+	 * @url     PUT ledger/{id}
+	 *
+	 * @throws  RestException  403  Insufficient rights, or entry already validated/exported
+	 * @throws  RestException  404  Ledger entry not found
+	 * @throws  RestException  500  Error while updating ledger entry
+	 */
+	public function putLedgerEntry($id, $request_data = null)
+	{
+		if (!DolibarrApiAccess::$user->hasRight('accounting', 'mouvements', 'creer')) {
+			throw new RestException(403, 'No permission to write ledger entries');
+		}
+
+		$entry = $this->_fetchLedgerEntry($id);
+
+		// Model layer (BookKeeping::update()) only checks fiscal-period-open state, not
+		// validation/export status - replicate the UI's own guard (card.php:1094-1104) here.
+		if (!empty($entry->date_export) || !empty($entry->date_validation)) {
+			throw new RestException(403, 'Ledger entry has already been validated or exported and can no longer be modified');
+		}
+
+		if (is_array($request_data)) {
+			foreach ($request_data as $field => $value) {
+				if (!in_array($field, self::$LEDGER_SETTABLE_FIELDS)) {
+					continue;
+				}
+				$entry->$field = $this->_checkValForAPI($field, $value, $entry);
+			}
+		}
+
+		$result = $entry->update(DolibarrApiAccess::$user);
+		if ($result < 0) {
+			throw new RestException(500, 'Error while updating ledger entry: '.$entry->errorsToString());
+		}
+
+		return $this->getLedgerEntry($id);
+	}
+
+	/**
+	 * Delete a bookkeeping (ledger) entry
+	 *
+	 * @param   int     $id     Bookkeeping entry ID
+	 * @return  array
+	 * @phan-return array{success:array{code:int,message:string}}
+	 * @phpstan-return array{success:array{code:int,message:string}}
+	 *
+	 * @url     DELETE ledger/{id}
+	 *
+	 * @throws  RestException  403  Insufficient rights, or entry already validated
+	 * @throws  RestException  404  Ledger entry not found
+	 * @throws  RestException  500  Error while deleting ledger entry
+	 */
+	public function deleteLedgerEntry($id)
+	{
+		if (!DolibarrApiAccess::$user->hasRight('accounting', 'mouvements', 'supprimer')) {
+			throw new RestException(403, 'No permission to delete ledger entries');
+		}
+
+		$entry = $this->_fetchLedgerEntry($id);
+
+		// Model layer (BookKeeping::delete()) only checks fiscal-period-open state, not
+		// validation status - replicate the UI's own delete-link guard (card.php:1106-1119),
+		// which (unlike the edit guard above) does not also block on date_export.
+		if (!empty($entry->date_validation)) {
+			throw new RestException(403, 'Ledger entry has already been validated and can no longer be deleted');
+		}
+
+		$result = $entry->delete(DolibarrApiAccess::$user);
+		if ($result < 0) {
+			throw new RestException(500, 'Error while deleting ledger entry: '.$entry->errorsToString());
+		}
+
+		return array(
+			'success' => array(
+				'code' => 200,
+				'message' => 'Ledger entry deleted'
+			)
+		);
+	}
+
+	/**
+	 * Manually letter (reconcile) a set of ledger entries sharing the same subledger account
+	 *
+	 * @param   array   $request_data   Request data
+	 * @phan-param array{ids?:array<int>,partial?:bool} $request_data
+	 * @phpstan-param array{ids?:array<int>,partial?:bool} $request_data
+	 * @return  array
+	 * @phan-return array{lettered:int}
+	 * @phpstan-return array{lettered:int}
+	 *
+	 * @url     POST ledger/lettering
+	 *
+	 * @throws  RestException  400  Bad parameters, or lettering is not enabled
+	 * @throws  RestException  403  Insufficient rights
+	 * @throws  RestException  500  Error while lettering
+	 */
+	public function postLedgerLettering($request_data = null)
+	{
+		if (!DolibarrApiAccess::$user->hasRight('accounting', 'mouvements', 'creer')) {
+			throw new RestException(403, 'No permission to write ledger entries');
+		}
+		if (!getDolGlobalInt('ACCOUNTING_ENABLE_LETTERING')) {
+			throw new RestException(400, 'Lettering is not enabled (ACCOUNTING_ENABLE_LETTERING)');
+		}
+
+		$ids = (!empty($request_data['ids']) && is_array($request_data['ids'])) ? array_map('intval', $request_data['ids']) : array();
+		if (empty($ids)) {
+			throw new RestException(400, 'ids is mandatory and must be a non-empty array');
+		}
+		$partial = !empty($request_data['partial']);
+
+		$result = $this->lettering->updateLettering($ids, 0, $partial);
+		if ($result < 0) {
+			throw new RestException(500, 'Error while lettering: '.$this->lettering->errorsToString());
+		}
+
+		return array('lettered' => (int) $result);
+	}
+
+	/**
+	 * Remove lettering (reconciliation) from a set of ledger entries
+	 *
+	 * @param   array   $request_data   Request data
+	 * @phan-param array{ids?:array<int>} $request_data
+	 * @phpstan-param array{ids?:array<int>} $request_data
+	 * @return  array
+	 * @phan-return array{unlettered:int}
+	 * @phpstan-return array{unlettered:int}
+	 *
+	 * @url     DELETE ledger/lettering
+	 *
+	 * @throws  RestException  400  Bad parameters, or lettering is not enabled
+	 * @throws  RestException  403  Insufficient rights
+	 * @throws  RestException  500  Error while removing lettering
+	 */
+	public function deleteLedgerLettering($request_data = null)
+	{
+		if (!DolibarrApiAccess::$user->hasRight('accounting', 'mouvements', 'creer')) {
+			throw new RestException(403, 'No permission to write ledger entries');
+		}
+		if (!getDolGlobalInt('ACCOUNTING_ENABLE_LETTERING')) {
+			throw new RestException(400, 'Lettering is not enabled (ACCOUNTING_ENABLE_LETTERING)');
+		}
+
+		$ids = (!empty($request_data['ids']) && is_array($request_data['ids'])) ? array_map('intval', $request_data['ids']) : array();
+		if (empty($ids)) {
+			throw new RestException(400, 'ids is mandatory and must be a non-empty array');
+		}
+
+		$result = $this->lettering->deleteLettering($ids);
+		if ($result < 0) {
+			throw new RestException(500, 'Error while removing lettering: '.$this->lettering->errorsToString());
+		}
+
+		return array('unlettered' => (int) $result);
+	}
+
+	/**
+	 * Automatically letter (reconcile) balanced ledger entries for a thirdparty's subledger accounts
+	 *
+	 * Uses POST rather than a GET: letteringThirdparty() is not read-only, it writes
+	 * lettering_code/date_lettering on matching balanced groups of entries, so a safe HTTP verb
+	 * would be misleading (a gateway/cache could prefetch or replay a GET).
+	 *
+	 * @param   int     $id     Thirdparty ID
+	 * @return  array
+	 * @phan-return array{success:array{code:int,message:string}}
+	 * @phpstan-return array{success:array{code:int,message:string}}
+	 *
+	 * @url     POST thirdparties/{id}/lettering
+	 *
+	 * @throws  RestException  400  Lettering is not enabled
+	 * @throws  RestException  403  Insufficient rights
+	 * @throws  RestException  500  Error while lettering
+	 */
+	public function postThirdpartyLettering($id)
+	{
+		if (!DolibarrApiAccess::$user->hasRight('accounting', 'mouvements', 'creer')) {
+			throw new RestException(403, 'No permission to write ledger entries');
+		}
+		if (!getDolGlobalInt('ACCOUNTING_ENABLE_LETTERING')) {
+			throw new RestException(400, 'Lettering is not enabled (ACCOUNTING_ENABLE_LETTERING)');
+		}
+
+		$result = $this->lettering->letteringThirdparty((int) $id);
+		if ($result < 0) {
+			throw new RestException(500, 'Error while lettering: '.$this->lettering->errorsToString());
+		}
+
+		return array(
+			'success' => array(
+				'code' => 200,
+				'message' => 'Lettering processed for thirdparty'
+			)
+		);
+	}
+
+	/**
 	 * Get list of fiscal periods (accounting closure periods), ordered by start date
 	 *
 	 * @return  array<array{id:int,label:string,date_start:int,date_end:int,status:int}>
@@ -652,6 +899,29 @@ class Accountancy extends DolibarrApi
 		}
 
 		return $fiscalyear;
+	}
+
+	/**
+	 * Fetch a bookkeeping (ledger) entry by id or throw a 404
+	 *
+	 * @param   int         $id     Bookkeeping entry ID
+	 * @return  BookKeeping
+	 *
+	 * @throws  RestException  404  Ledger entry not found
+	 * @throws  RestException  503  Error while fetching ledger entry
+	 */
+	private function _fetchLedgerEntry($id)
+	{
+		$entry = new BookKeeping($this->db);
+		$result = $entry->fetch((int) $id);
+		if ($result < 0) {
+			throw new RestException(503, 'Error while fetching ledger entry: '.$entry->errorsToString());
+		}
+		if (!$result) {
+			throw new RestException(404, 'Ledger entry not found');
+		}
+
+		return $entry;
 	}
 
 	/**

@@ -21,6 +21,20 @@ read endpoint's actual convention — `comptarapport` exists in `modAccounting.c
 UI page or existing API method actually checks it). `exportData()` was left untouched — already
 confirmed to cover all `AccountancyExport` formats end to end.
 
+Phase 3a (Ledger CRUD + lettering, the safe additive half of Phase 3) has been implemented — see
+`GET/PUT/DELETE ledger/{id}`, `POST/DELETE ledger/lettering`, and `POST thirdparties/{id}/lettering`
+added to `htdocs/accountancy/class/api_accountancy.class.php`, wrapping already-correct
+`BookKeeping::fetch()/update()/delete()` and `Lettering::updateLettering()/deleteLettering()/
+letteringThirdparty()`. Gated on `accounting->mouvements->{lire,creer,supprimer}`. `PUT` is
+restricted to the exact field set the UI's single-line edit form exposes (`numero_compte`,
+`subledger_account`, `subledger_label`, `label_compte`, `label_operation`, `debit`, `credit`;
+piece-level fields stay UI-only) and both `PUT`/`DELETE` replicate the UI's own
+validated/exported guards at the API layer, since the model layer doesn't enforce them.
+`POST thirdparties/{id}/lettering` deliberately deviates from this section's original `GET`
+verb — `letteringThirdparty()` mutates data (calls `updateLettering()` internally), so `GET`
+would be unsafe. Test coverage in `test/phpunit/AccountingLedgerApiTest.php`; the write-side
+journal-transfer refactor (Phase 3b below) remains open.
+
 This backlog covers the remaining phases needed for the accountancy module's REST API to
 fully drive the module end to end (recurring operations: binding, ledger transfer, closure,
 reporting). Each phase is independently mergeable. Phase 3 (ledger transfer) should be done
@@ -96,36 +110,105 @@ bootstrap pattern) covering `bindInvoiceLine()`/`unbindInvoiceLine()`.
 
 ## Phase 3 — Ledger transfer / "Record transactions in accounting" (step C)
 
-**Highest-risk phase — refactor, not reimplementation.**
+**Highest-risk phase — refactor, not reimplementation.** Split into 3a (done, additive, low
+risk) and 3b (remaining, refactor, high risk) — see below.
 
-**Known bug to account for**: `BookKeeping::create()` (`bookkeeping.class.php` ~line 506-508)
-sets `$result = 0` on a *successful* insert instead of returning the new row's id — confirmed
-live against MariaDB while verifying Phase 4. `$this->id` is set correctly, only the return
-value is wrong. Not fixed as part of Phase 4 (out of scope, and this method is squarely Phase
-3's territory — a fix here has to go through the same behavior-preserving-refactor discipline
-as the rest of this phase). Any Phase 3 code that currently branches on `create()`'s return
-value expecting a positive id (rather than checking `< 0` for error / reading `->id` after)
-should be corrected as part of the refactor, and the `BookKeepingTest::testBookKeepingCreate()`
-assertion (`assertLessThan($result, 0)`, i.e. expects `$result > 0`) is likely silently
-succeeding today only because the two args are backwards from what the name suggests. Worth a
-one-line fix (`$result = 0;` → `$result = $id;` or `$result = 1;`) alongside the phase 3 work,
-with its own before/after regression check like everything else in this phase.
+### Phase 3a — Ledger CRUD + lettering — Implemented
+
+`BookKeeping::fetch()/update()/delete()` and `Lettering::updateLettering()/deleteLettering()/
+letteringThirdparty()` were already correct, so this half was a straightforward additive wrap —
+see the status paragraph near the top of this file for exactly what shipped. Nothing here
+changed `bookkeeping.class.php`, `lettering.class.php`, `accountingjournal.class.php`, or any
+journal UI page.
+
+### Phase 3b — Journal transfer refactor — Remaining, do this next
+
+**This is the genuinely risky part of Phase 3.** `BookKeeping::create()`,
+`AccountingJournal::writeIntoBookkeeping()`, and the 5 journal UI pages are untouched by 3a.
+
+**Known bug to account for**: `BookKeeping::create()` (`bookkeeping.class.php`, `create()`
+method) sets `$result = 0` on a *successful* insert instead of returning the new row's id —
+confirmed live against MariaDB while verifying Phase 4, and re-confirmed while scoping 3b: the
+exact lines are `$id = $this->db->last_insert_id(...); if ($id > 0) { $this->id = $id; $result
+= 0; }`, and further down, if triggers run (`$notrigger` not set), `$result =
+$this->call_trigger('BOOKKEEPING_CREATE', $user);` **overwrites `$result` again** before the
+final `return $error ? -1 * $error : $result;`. So this is not a one-line fix — naively changing
+`$result = 0` to `$result = $id` would still get clobbered by the trigger-return-value
+reassignment whenever triggers are enabled (the common case). `$this->id` is set correctly in
+all cases; that's what every existing caller already relies on (`createFromValues()`,
+`writeIntoBookkeeping()`, `BookKeepingTest`, `AccountingClosureApiTest`). A real fix needs to
+either capture `$id` before the trigger call and restore it after (if `call_trigger()` returned
+`>= 0`), or stop overloading `$result` for two different meanings. Do this fix inside 3b's own
+behavior-preserving-refactor discipline (golden-baseline diff, not a drive-by patch), since
+`writeIntoBookkeeping()` is `create()`'s only real production caller today. Note
+`BookKeepingTest::testBookKeepingCreate()`'s current assertion (`assertLessThan($result, 0)`,
+i.e. expects `$result > 0`) is silently passing today only because the two args are backwards
+from what the name suggests — worth fixing that assertion alongside the class fix, not before.
 
 `BookKeeping` (`htdocs/accountancy/class/bookkeeping.class.php`) already has full
 CRUD/list/balance (`create`, `createFromValues`, `createStd`, `fetch*`, `update*`, `delete*`,
 `export_bookkeeping`, `transformTransaction`, `canModifyBookkeeping`, `validBookkeepingDate`,
 `assignAccountMass`) — straightforward wrap. `AccountingJournal::writeIntoBookkeeping()`
-(line 1394) is already the reusable transfer method for the "various operations" journal only
-(used by `htdocs/accountancy/journal/variousjournal.php:135`).
+(line 1454) is already the reusable transfer method for the "various operations" journal only
+(used by `htdocs/accountancy/journal/variousjournal.php`, action block at lines 131-150). Its
+structure (confirmed by reading it in full): fires an `accountingjournaldao`/`writeBookkeeping`
+hook first (if the hook fully replaces native logic, native processing is skipped entirely);
+otherwise loops `$journal_data` per document, builds a `BookKeeping` object per line from a
+normalized `$element['blocks']` array, calls `create()`, aggregates errors
+(`alreadyjournalized`/`other`/`amountsnotbalanced`), commits/rolls back per document, and stops
+early once `$max_nb_errors` (default 10) is hit. Returns `$error ? -$error : 1` — the convention
+any new `POST journals/{id}/transfer` endpoint should mirror. The page-level glue in
+`variousjournal.php` is thin (`getData($user, 'bookkeeping', ...)` builds `$journal_data`,
+`writeIntoBookkeeping($user, $journal_data)` writes it, `setEventMessages()` on the result) —
+this is the template to match for the other 5 pages' endpoints and extracted methods.
 
-The other 4 journal types duplicate this kind of logic **inline** instead of factoring it:
+`AccountingJournal::getLibType()` is a **label-only** dispatch (`$nature` → translated string
+via `LibType()`), not a functional dispatch — there is no existing `$nature`-keyed routing table
+from a journal to its transfer page/method. `POST journals/{id}/transfer` will need to build one
+from scratch: nature 1→various, 2→sells, 3→purchases, 4→bank/treasury (two pages share nature
+4 — `bankjournal.php`/`treasuryjournal.php` — decide the dispatch key between them, e.g. by
+journal code, not just nature), 5→expense reports. Note nature 8 (inventory) has no `LibType()`
+label at all today (missing `elseif ($nature == 8)` branch) — a separate minor pre-existing gap,
+worth a one-line fix alongside 3b but not blocking it.
 
-| Journal | Page | Inline block (`action=='writebookkeeping'`) |
-|---|---|---|
-| Sales | `htdocs/accountancy/journal/sellsjournal.php` | ~line 497-921 (~420 lines) |
-| Purchases | `htdocs/accountancy/journal/purchasesjournal.php` | ~line 445-827 (~380 lines) |
-| Bank / Treasury | `htdocs/accountancy/journal/bankjournal.php` (~716-1084) and `htdocs/accountancy/journal/treasuryjournal.php` (~1135-1355) | near-duplicate pair |
-| Expense reports | `htdocs/accountancy/journal/expensereportsjournal.php` | ~line 276-538 (~260 lines) |
+The other 4 journal types duplicate this kind of logic **inline** instead of factoring it. Exact
+block boundaries (all guarded by `action == 'writebookkeeping'`, confirmed via grep):
+
+| Journal | Page | Inline block lines | Approx. size |
+|---|---|---|---|
+| Sales | `sellsjournal.php` | 497-921 | ~425 lines |
+| Purchases | `purchasesjournal.php` | 445-830 | ~385 lines |
+| Bank | `bankjournal.php` | 716-1208 | ~490 lines (largest — highest risk) |
+| Treasury | `treasuryjournal.php` | 1135-1359 | ~225 lines |
+| Expense reports | `expensereportsjournal.php` | 276-542 | ~265 lines |
+
+`treasuryjournal.php`'s permission check is currently **commented out**
+(`if ($action == 'writebookkeeping' /* && $user->hasRight(...) */)` with a "test on permission
+already done" note) — a minor pre-existing inconsistency vs. the other 4 pages' inline
+`$user->hasRight('accounting', 'bind', 'write')` check. Worth normalizing during the 3b
+extraction (all 5 should end up with the same explicit check the shared method or its callers
+enforce), not silently fixed as an unrelated drive-by before that.
+
+`sellsjournal.php` (read in full while scoping this) is representative of the pattern: loops
+`foreach ($tabfac as $key => $val)` (one iteration per invoice, not per line), creates up to 5
+distinct kinds of `BookKeeping` rows per invoice (retained-warranty, thirdparty/customer,
+product/service revenue, VAT/localtax, revenue-stamp), wraps each invoice in
+`$db->begin()/commit()/rollback()` with a debit/credit balance check before commit, and aborts
+after 10 accumulated errors — all logic `writeIntoBookkeeping()` already has, just operating on
+raw page-local arrays (`$tabfac`, `$tabttc`, `$tabht`, `$tabtva`, ...) instead of the normalized
+`$journal_data` structure `getData()` produces for `variousjournal.php`. Two gaps to carry
+through the extraction, not silently drop:
+- A "replaced invoice" skip branch (`sellsjournal.php:534-548`) with **no equivalent** in
+  `writeIntoBookkeeping()` or its `getData()` — an invoice whose `close_code ==
+  Facture::CLOSECODE_REPLACED` and isn't yet in the bookkeeping is skipped entirely before any
+  rows are built for it. This needs to live in a `getData()`-equivalent data-prep step (e.g. an
+  `element['skip']` flag), not inside the write method itself.
+- `writeIntoBookkeeping()` fires an `accountingjournaldao`/`writeBookkeeping` hook
+  (`accountingjournal.class.php:1461-1468`) before doing anything; the inline `sellsjournal.php`
+  write block (lines 497-921) has **no such hook call** today. Extracting the logic into a
+  shared method either introduces this hook point for sells/purchases/bank/treasury/expense
+  reports (new behavior for third-party hook consumers — flag this explicitly, don't do it
+  silently) or the extraction needs its own justification for why it's safe to add.
 
 **3.1** Add to `AccountingJournal`, named consistently with the existing method:
 ```php
@@ -157,14 +240,7 @@ later change under its own review.
 | `POST journals/{id}/transfer` `{date_start, date_end}` | Dispatches on the journal's nature (`getLibType()`) to the matching `writeIntoBookkeepingFor*()` / `writeIntoBookkeeping()` | `accounting->bind->write` (matches all 5 pages today) |
 | `GET journals/{id}/pendingdata?date_start&date_end` | Preview via `getData()`/`getAssetData()` without writing | `accounting->bind->write` or `->mouvements->lire` |
 
-New ledger endpoints on `Accountancy` (`api_accountancy.class.php`), wrapping already-correct
-`BookKeeping` methods: `GET ledger` (`fetchAll`), `GET ledger/{id}`, `PUT ledger/{id}`
-(`update`), `DELETE ledger/{id}`, `GET ledger/balance` (`fetchAllBalance`) — permissions
-`accounting->mouvements->{lire,creer,supprimer,supprimer_tous}` respectively. Bundle lettering
-here too, since it operates on rows this phase produces
-(`htdocs/accountancy/class/lettering.class.php`, `Lettering extends BookKeeping`): `POST
-ledger/lettering` (`updateLettering`), `DELETE ledger/lettering` (`deleteLettering`), `GET
-thirdparties/{id}/lettering` (`letteringThirdparty`) — same `mouvements` permission family.
+Ledger CRUD + lettering endpoints on `Accountancy` are already implemented — see Phase 3a above.
 
 **Explicit risk flag**: this is a behavior-preserving refactor of live production financial
 logic, not new logic. Any output deviation (account numbers, piece numbering, rounding,
