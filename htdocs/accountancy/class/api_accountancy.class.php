@@ -278,6 +278,181 @@ class Accountancy extends DolibarrApi
 	}
 
 	/**
+	 * Get a list of bookkeeping (ledger) entries
+	 *
+	 * @param   string  $sortfield              Sort field
+	 * @param   string  $sortorder              Sort order
+	 * @param   int     $limit                  Limit for list
+	 * @param   int     $page                   Page number
+	 * @param   string  $type                   '' or 'general' for general account listing, 'sub' for subledger (auxiliary) account listing
+	 * @param   string  $date_start             Filter on doc_date >= (format YYYY-MM-DD)
+	 * @param   string  $date_end               Filter on doc_date <= (format YYYY-MM-DD)
+	 * @param   string  $account_min            Filter on account number range (general account, or subledger account if type=sub) >=
+	 * @param   string  $account_max            Filter on account number range (general account, or subledger account if type=sub) <=
+	 * @param   string  $code_journal           Filter on journal code(s), comma separated for multiple
+	 * @param   int     $piece_num              Filter on piece number
+	 * @param   int     $fk_doc                 Filter on source document id
+	 * @param   int     $fk_docdet              Filter on source document line id
+	 * @param   string  $date_validation_start  Filter on date_validated >= (format YYYY-MM-DD)
+	 * @param   string  $date_validation_end    Filter on date_validated <= (format YYYY-MM-DD)
+	 * @param   string  $export_status          '' or 'all' to show already exported movements (default), 'notexported' to hide them. Ignored when type=sub
+	 * @param   int     $reconciled             1 to show all movements (default), 0 to show only unreconciled (unlettered) movements
+	 * @param   string  $sqlfilters             Other criteria to filter answers, syntax example "(t.numero_compte:like:'411%')". Mutually exclusive with the filters above; not supported when type=sub
+	 * @param   string  $properties             Restrict the data returned to these properties. Ignored if empty. Comma separated list of properties names
+	 * @param   bool    $pagination_data        Include pagination data in the response. Only supported when type=sub
+	 * @return  array
+	 * @phan-return array<int,BookKeepingLine>|array{data:array<int,BookKeepingLine>,pagination:array{total:int,page:int,page_count:int,limit:int}}
+	 * @phpstan-return array<int,BookKeepingLine>|array{data:array<int,BookKeepingLine>,pagination:array{total:int,page:int,page_count:int,limit:int}}
+	 *
+	 * @url     GET ledger
+	 *
+	 * @throws  RestException  400  Bad parameters
+	 * @throws  RestException  403  Insufficient rights
+	 * @throws  RestException  503  Error while fetching ledger entries
+	 */
+	public function getLedger($sortfield = 't.piece_num, t.rowid', $sortorder = 'ASC', $limit = 100, $page = 0, $type = '', $date_start = '', $date_end = '', $account_min = '', $account_max = '', $code_journal = '', $piece_num = 0, $fk_doc = 0, $fk_docdet = 0, $date_validation_start = '', $date_validation_end = '', $export_status = '', $reconciled = 1, $sqlfilters = '', $properties = '', $pagination_data = false)
+	{
+		if (!DolibarrApiAccess::$user->hasRight('accounting', 'comptarapport', 'lire') && !DolibarrApiAccess::$user->hasRight('accounting', 'mouvements', 'lire')) {
+			throw new RestException(403, 'No permission to read accounting reports');
+		}
+
+		if ($type != '' && $type != 'general' && $type != 'sub') {
+			throw new RestException(400, "type must be '', 'general' or 'sub'");
+		}
+		$issub = ($type == 'sub');
+
+		if ($sqlfilters != '' && $issub) {
+			throw new RestException(400, 'sqlfilters is not supported when type=sub');
+		}
+		if ($pagination_data && !$issub) {
+			throw new RestException(400, 'pagination_data is only supported when type=sub');
+		}
+
+		$obj_ret = array();
+
+		if ($sqlfilters != '') {
+			$filter = $sqlfilters;
+		} else {
+			$filter = $this->_buildLedgerFilter($type, $date_start, $date_end, $account_min, $account_max, $code_journal, $reconciled);
+			if (!empty($piece_num)) {
+				$filter['t.piece_num'] = (int) $piece_num;
+			}
+			if (!empty($fk_doc)) {
+				$filter['t.fk_doc'] = (int) $fk_doc;
+			}
+			if (!empty($fk_docdet)) {
+				$filter['t.fk_docdet'] = (int) $fk_docdet;
+			}
+			if ($date_validation_start !== '') {
+				$filter['t.date_validated>='] = strtotime($date_validation_start);
+			}
+			if ($date_validation_end !== '') {
+				$filter['t.date_validated<='] = strtotime($date_validation_end);
+			}
+		}
+
+		if ($page < 0) {
+			$page = 0;
+		}
+		$offset = $limit * $page;
+
+		if ($issub) {
+			if ($pagination_data) {
+				$total = $this->bookkeeping->fetchAllByAccount($sortorder, $sortfield, 0, 0, $filter, 'AND', 1, 1);
+				if ($total < 0) {
+					throw new RestException(503, 'Error while fetching ledger entries: '.$this->bookkeeping->errorsToString());
+				}
+			}
+
+			$result = $this->bookkeeping->fetchAllByAccount($sortorder, $sortfield, $limit, $offset, $filter, 'AND', 1);
+		} else {
+			$showAlreadyExportMovements = ($export_status == 'notexported') ? 0 : 1;
+			$result = $this->bookkeeping->fetchAll($sortorder, $sortfield, $limit, $offset, $filter, 'AND', $showAlreadyExportMovements);
+		}
+
+		if ($result < 0) {
+			throw new RestException(503, 'Error while fetching ledger entries: '.$this->bookkeeping->errorsToString());
+		}
+
+		if (is_array($this->bookkeeping->lines)) {
+			foreach ($this->bookkeeping->lines as $line) {
+				$obj_ret[] = $this->_filterObjectProperties($this->_cleanObjectDatas($line), $properties);
+			}
+		}
+
+		if ($pagination_data) {
+			return array(
+				'data' => $obj_ret,
+				'pagination' => array(
+					'total' => (int) $total,
+					'page' => $page,
+					'page_count' => ($limit ? (int) ceil((int) $total / $limit) : 0),
+					'limit' => $limit
+				)
+			);
+		}
+
+		return $obj_ret;
+	}
+
+	/**
+	 * Get the trial balance (bookkeeping entries grouped and summed by account)
+	 *
+	 * @param   string  $type           '' or 'general' to group by general account (default), 'sub' to group by subledger (auxiliary) account
+	 * @param   string  $date_start     Filter on doc_date >= (format YYYY-MM-DD)
+	 * @param   string  $date_end       Filter on doc_date <= (format YYYY-MM-DD)
+	 * @param   string  $account_min    Filter on account number range (general account, or subledger account if type=sub) >=
+	 * @param   string  $account_max    Filter on account number range (general account, or subledger account if type=sub) <=
+	 * @param   string  $code_journal   Filter on journal code(s), comma separated for multiple
+	 * @param   int     $reconciled     1 to show all movements (default), 0 to include only unreconciled (unlettered) movements in the sums
+	 * @param   string  $sortfield      Sort field
+	 * @param   string  $sortorder      Sort order
+	 * @param   int     $limit          Limit for list, 0 means no limit (default, trial balances are naturally small)
+	 * @param   int     $page           Page number, used only if limit is set
+	 * @return  array
+	 * @phan-return array<int,BookKeepingLine>
+	 * @phpstan-return array<int,BookKeepingLine>
+	 *
+	 * @url     GET ledger/balance
+	 *
+	 * @throws  RestException  400  Bad parameters
+	 * @throws  RestException  403  Insufficient rights
+	 * @throws  RestException  503  Error while fetching trial balance
+	 */
+	public function getLedgerBalance($type = '', $date_start = '', $date_end = '', $account_min = '', $account_max = '', $code_journal = '', $reconciled = 1, $sortfield = 't.numero_compte', $sortorder = 'ASC', $limit = 0, $page = 0)
+	{
+		if (!DolibarrApiAccess::$user->hasRight('accounting', 'comptarapport', 'lire') && !DolibarrApiAccess::$user->hasRight('accounting', 'mouvements', 'lire')) {
+			throw new RestException(403, 'No permission to read accounting reports');
+		}
+
+		if ($type != '' && $type != 'general' && $type != 'sub') {
+			throw new RestException(400, "type must be '', 'general' or 'sub'");
+		}
+		$issub = ($type == 'sub');
+
+		$filter = $this->_buildLedgerFilter($type, $date_start, $date_end, $account_min, $account_max, $code_journal, $reconciled);
+
+		if ($page < 0) {
+			$page = 0;
+		}
+		$offset = $limit * $page;
+
+		$result = $this->bookkeeping->fetchAllBalance($sortorder, $sortfield, $limit, $offset, $filter, 'AND', $issub ? 1 : 0);
+		if ($result < 0) {
+			throw new RestException(503, 'Error while fetching trial balance: '.$this->bookkeeping->errorsToString());
+		}
+
+		$obj_ret = array();
+		if (is_array($this->bookkeeping->lines)) {
+			foreach ($this->bookkeeping->lines as $line) {
+				$obj_ret[] = $this->_cleanObjectDatas($line);
+			}
+		}
+
+		return $obj_ret;
+	}
+
+	/**
 	 * Get list of fiscal periods (accounting closure periods), ordered by start date
 	 *
 	 * @return  array<array{id:int,label:string,date_start:int,date_end:int,status:int}>
@@ -477,5 +652,46 @@ class Accountancy extends DolibarrApi
 		}
 
 		return $fiscalyear;
+	}
+
+	/**
+	 * Build the array-form BookKeeping filter shared by getLedger() and getLedgerBalance()
+	 *
+	 * @param   string  $type           '' or 'general' or 'sub'
+	 * @param   string  $date_start     Filter on doc_date >= (format YYYY-MM-DD)
+	 * @param   string  $date_end       Filter on doc_date <= (format YYYY-MM-DD)
+	 * @param   string  $account_min    Filter on account number range >=
+	 * @param   string  $account_max    Filter on account number range <=
+	 * @param   string  $code_journal   Filter on journal code(s), comma separated for multiple
+	 * @param   int     $reconciled     1 = no filter, 0 = only unreconciled (unlettered) movements
+	 * @return  array
+	 * @phan-return array<string,mixed>
+	 * @phpstan-return array<string,mixed>
+	 */
+	private function _buildLedgerFilter($type, $date_start, $date_end, $account_min, $account_max, $code_journal, $reconciled)
+	{
+		$filter = array();
+		$accountkey = ($type == 'sub') ? 't.subledger_account' : 't.numero_compte';
+
+		if ($date_start !== '') {
+			$filter['t.doc_date>='] = strtotime($date_start);
+		}
+		if ($date_end !== '') {
+			$filter['t.doc_date<='] = strtotime($date_end);
+		}
+		if ($account_min !== '') {
+			$filter[$accountkey.'>='] = $account_min;
+		}
+		if ($account_max !== '') {
+			$filter[$accountkey.'<='] = $account_max;
+		}
+		if ($code_journal !== '') {
+			$filter['t.code_journal'] = (strpos($code_journal, ',') !== false) ? explode(',', $code_journal) : $code_journal;
+		}
+		if (empty($reconciled)) {
+			$filter['t.reconciled_option'] = 1;
+		}
+
+		return $filter;
 	}
 }

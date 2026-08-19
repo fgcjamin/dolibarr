@@ -12,6 +12,15 @@ to `htdocs/accountancy/class/api_accountancy.class.php` and
 `api_accountingclosure.class.php`, since `api_accountancy.class.php` stayed well under the
 ~500-line split threshold.
 
+Phase 5 (Reporting/exports) has been implemented — see the `getLedger()` (`GET ledger`) and
+`getLedgerBalance()` (`GET ledger/balance`) endpoints added to
+`htdocs/accountancy/class/api_accountancy.class.php`, wrapping `BookKeeping::fetchAll()`/
+`fetchAllByAccount()`/`fetchAllBalance()`. Gated on `accounting->comptarapport->lire` OR
+`accounting->mouvements->lire` (the backlog-documented right plus a fallback matching every other
+read endpoint's actual convention — `comptarapport` exists in `modAccounting.class.php` but no
+UI page or existing API method actually checks it). `exportData()` was left untouched — already
+confirmed to cover all `AccountancyExport` formats end to end.
+
 This backlog covers the remaining phases needed for the accountancy module's REST API to
 fully drive the module end to end (recurring operations: binding, ledger transfer, closure,
 reporting). Each phase is independently mergeable. Phase 3 (ledger transfer) should be done
