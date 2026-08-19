@@ -96,7 +96,78 @@ own call sequence and the class methods alone), a direct API smoke test of both 
 skip, mirroring the sells test structure) — reverse-charge substitution and the VAT-NPR
 counterpart are deliberately left as **follow-up** test cases, not covered by this slice's
 fixture (which has both switched off to keep the expected math simple: only 3 of the 4 create
-sites fire). Bank and treasury remain open — see the rewritten Phase 3b section below.
+sites fire). Bank and treasury remained open at this point — see the rewritten Phase 3b section
+below.
+
+Phase 3b, fourth slice (bank journal transfer, non-`RECETTES-DEPENSES` accounting mode) has been
+implemented — see `AccountingJournal::getDataForBank()`/`writeIntoBookkeepingForBank()` in
+`htdocs/accountancy/class/accountingjournal.class.php`, a verbatim lift of `bankjournal.php`'s
+former inline data-collection (one query, zero hooks — confirmed the whole file fires none, and
+has no `ACCOUNTANCY_MAX_TOO_MANY_LINES_TO_PROCESS` guard to preserve, unlike sells/purchases) and
+write loop (3 physical `create()` sites — bank line, thirdparty/counterpart, waiting-account
+fallback — behind an 11-way payment-type branch: `payment`/`payment_supplier`/
+`payment_expensereport`/`payment_salary`/`sc`+`payment_sc`/`payment_vat`/`payment_donation`/
+`member`/`payment_loan`/`payment_various`/`banktransfert`, plus an `unknown` fallback to
+`ACCOUNTING_ACCOUNT_SUSPENSE`). The page-local `getSourceDocRef()` function
+(`bankjournal.php:1607-1715`) moved onto the class as **`getSourceDocRefForBank()`** — `public`,
+not `private`, since the page's own export-CSV and view-rendering blocks call it too, from
+outside the class. Wired into `POST journals/{id}/transfer`/`GET journals/{id}/pendingdata` as
+nature `4`, but **only** when `getDolGlobalString('ACCOUNTING_MODE') != 'RECETTES-DEPENSES'` —
+both endpoints throw `RestException(501, ...)` in `RECETTES-DEPENSES` mode instead, since that
+mode routes through `treasuryjournal.php` (still unimplemented, see below), and there is no other
+field on the nature-4 journal row itself to distinguish the two pages (`eldy.lib.php:1811-1876`
+makes the same `ACCOUNTING_MODE` check to pick which page's menu entry to show). `pendingData()`'s
+nature-4 branch deliberately does not attempt to compute a resolved doc ref or per-line error
+flag (bank's data-collection has no `errorforinvoice`-style map the way sells/purchases do) — it
+returns the bank line's own already-collected raw `ref` and `has_error => false` throughout,
+consistent with the endpoint's existing "not a full trial-balance preview" scope.
+
+**Two real bugs caught and fixed during this extraction** (both confirmed via a golden
+pre-refactor baseline diff, not just code review):
+1. `$account_supplier`/`$account_customer`/`$account_employee`/`$account_transfer` (derived from
+   `getDolGlobalString(...)` config, e.g. `ACCOUNTING_ACCOUNT_TRANSFER_CASH`) were computed inside
+   the *data-collection* block but consumed by the *write* block (`$account_transfer`, inside the
+   `banktransfert` reflabel) and by the page's own export/view rendering (all four) — an implicit
+   page-scope handoff that broke once data-collection became a separate method call. Fixed by
+   adding all four to `getDataForBank()`'s return array; the page unpacks them once alongside the
+   7 `$tab*` arrays, and `writeIntoBookkeepingForBank()` unpacks `account_transfer` from its own
+   `getDataForBank()` call.
+2. The CSV-export action (`bankjournal.php`, the 3 `$account_ledger = (!empty($obj->...)) ? ... :
+   $account_xxx` fallback lines) relied on `$obj` — the bank-line query's loop variable —
+   **still holding its last value from data-collection** after the loop ended, since both blocks
+   used to share page-level scope. This was already fragile (the "fallback" was really "whatever
+   the *last* row happened to contain", not per-row data — likely a preexisting latent bug, not
+   intentional), but extracting data-collection into a method makes `$obj` genuinely undefined
+   there, which would surface as a live PHP warning corrupting the CSV output. Fixed by using
+   `$tabcompany[$key]['accountancy_code_general']` (customer/supplier) and
+   `$tabuser[$key]['accountancy_code_general']` (salary) instead — the actual per-bank-line value
+   already collected for that purpose, and what the write block itself uses for the same fields.
+   The view-block's own 3 analogous lines were **left untouched**: they already read from an
+   unrelated count-query's `$obj` (reassigned earlier in the view block, before reaching those
+   lines) even before this refactor, so nothing changed there — not this slice's bug to fix.
+
+Also confirmed verbatim and **preserved, not "corrected"**: `writeIntoBookkeepingForBank()`'s
+lettering call uses `Lettering::bookkeepingLetteringAll()` (plural), unlike
+sells/purchases' `bookkeepingLettering()` (singular) — a genuine difference in the original
+source, not a copy-paste slip; and the `$max_nb_errors` parameter defaults to `5` (bank's
+original `$MAXNBERRORS`), not `10` like every other journal.
+
+Verified against a golden pre-refactor baseline (byte-for-byte match on `numero_compte`/
+`subledger_account`/`debit`/`credit` for a `payment`-type customer payment, via both the page's
+own call sequence and the class methods alone), idempotency, and a direct API smoke test of both
+new `transfer()`/`pendingData()` branches (including the 501 path with `ACCOUNTING_MODE =
+'RECETTES-DEPENSES'`). Test coverage in `test/phpunit/AccountingJournalBankTransferTest.php`:
+the golden-baseline `payment` flow, plus a `testUnknownTypeUsesSuspenseAccount()` edge case (a
+bank line with no `bank_url` links at all, landing on the configured suspense account) — a branch
+none of the other 3 journals' tests exercise. **Testing-environment gotcha worth keeping**:
+`BookKeeping::validBookkeepingDate()` caches the active-fiscal-period list in `$conf->cache` on
+first use and never auto-refreshes it; a phpunit test class with multiple methods, each seeding
+its own new fiscal year, must `unset($conf->cache['active_fiscal_period_cached'])` right after
+creating each new `Fiscalyear`, or a later test method's period is invisible to
+`BookKeeping::create()`'s date check even though the row exists in the DB (this silently didn't
+bite the purchases/sells tests only because their second test method's fixture — a replaced
+invoice — returns before ever calling `BookKeeping::create()`). Treasury remains the sole open
+item — see the rewritten Phase 3b section below.
 
 This backlog covers the remaining phases needed for the accountancy module's REST API to
 fully drive the module end to end (recurring operations: binding, ledger transfer, closure,
@@ -276,16 +347,18 @@ convention every extracted `writeIntoBookkeepingForXxx()` mirrors.
 `AccountingJournal::getLibType()` is a **label-only** dispatch (`$nature` → translated string),
 not a functional dispatch. The API's nature-based dispatch (`AccountingJournals::transfer()`/
 `pendingData()` in `htdocs/accountancy/class/api_accountingjournals.class.php`) currently
-supports natures `1` (various), `2` (sells), `3` (purchases), and `5` (expense reports) — only
-nature `4` (bank/treasury) remains, and it **needs special handling, not a simple `elseif`**, see
-below.
+supports natures `1` (various), `2` (sells), `3` (purchases), `4` (bank — only when
+`ACCOUNTING_MODE != 'RECETTES-DEPENSES'`, a `501` otherwise), and `5` (expense reports). Treasury
+(nature `4` in `RECETTES-DEPENSES` mode) is the only case still returning the generic
+not-yet-implemented response — its own `getDataForTreasury()`/`writeIntoBookkeepingForTreasury()`
+pair doesn't exist yet, see below.
 
 | Journal | Page | Inline block lines | Approx. size | Status |
 |---|---|---|---|---|
 | Sales | `sellsjournal.php` | 496-921 (pre-refactor) | ~425 lines | **Done** |
 | Expense reports | `expensereportsjournal.php` | 276-542 (pre-refactor) | ~265 lines | **Done** |
 | Purchases | `purchasesjournal.php` | 444-827 | ~385 lines | **Done** |
-| Bank | `bankjournal.php` | 716-1084 | ~370 lines | Remaining |
+| Bank | `bankjournal.php` | 716-1084 | ~370 lines | **Done** (non-`RECETTES-DEPENSES` mode) |
 | Treasury | `treasuryjournal.php` | 1134-1355 | ~220 lines | Remaining |
 
 #### Purchases (nature 3) — Implemented (kept as reference for the bank/treasury extractions below)
@@ -332,6 +405,13 @@ approach sells used for its replaced-invoice guard.
 
 #### Bank and treasury (both nature 4) — genuinely separate implementations, not a shared method
 
+**Bank is now Implemented** — see the status paragraph near the top of this file for exactly what
+shipped (`getDataForBank()`/`writeIntoBookkeepingForBank()`/`getSourceDocRefForBank()` on
+`AccountingJournal`, wired into nature `4` on the API's `transfer()`/`pendingData()` gated by
+`ACCOUNTING_MODE`, two real bugs caught and fixed, golden-baseline + phpunit coverage). Everything
+below in this section was written *before* that slice and remains accurate for **treasury only**
+— read it as "what treasury still needs," not as still-open work for bank.
+
 **Critical finding, changes the original plan**: `bankjournal.php` and `treasuryjournal.php`
 both operate on the *same* journal row (`code='BQ'`, nature 4 — there is only one nature-4 row
 in the default `llx_accounting_journal` seed data). They are **not** two views of the same
@@ -352,7 +432,11 @@ picks `treasuryjournal.php` when `getDolGlobalString('ACCOUNTING_MODE') == 'RECE
 dispatch must replicate this same `ACCOUNTING_MODE` check** — there is no other field to key on
 since both pages target the identical journal id/code.
 
-**Bank** (`bankjournal.php`): data-collection (147-713, zero hooks in the whole file) builds
+**Bank** (`bankjournal.php`) — **Implemented, see the status paragraph near the top of this file
+for what actually shipped**; this paragraph is kept as the original pre-implementation spec,
+confirmed accurate against the real extraction except where noted there (the `getSourceDocRef()`
+migration turned out to need `public`, not `private`, since export/view call it too — see below).
+Original spec: data-collection (147-713, zero hooks in the whole file) builds
 `$tabpay`/`$tabaccount`/`$tabbq`/`$tabtp`/`$tabcompany`/`$tabuser`/`$tabtype`/`$tabmoreinfo`, one
 `db->begin()`/`commit()` per bank line. Write block (716-1084, permission check present and
 active) has only 3 physical `create()` call sites but an **11-way payment-type branch**
@@ -360,10 +444,12 @@ active) has only 3 physical `create()` call sites but an **11-way payment-type b
 `payment_donation`/`member`/`payment_loan`/`payment_various`/`banktransfert`, plus an `unknown`
 fallback to a suspense account) resolving `subledger_account`/`numero_compte` per type. **Depends
 on a page-local helper function `getSourceDocRef()` (defined at the bottom of the same file,
-lines 1607-1715) that must move into the class too** (e.g. as a private method) — it isn't safe
-to leave as a bare page-scoped function, since the extracted class method would then be
-unusable outside that page. Max-errors hardcoded `5` (not `10` like the other journals) —
-preserve that as the parameter default, don't silently harmonize to `10`.
+lines 1607-1715) that must move into the class too** (as `getSourceDocRefForBank()`, `public` —
+not `private` as originally guessed here, since the page's own export-CSV and view-rendering
+blocks call it too, from outside the class) — it isn't safe to leave as a bare page-scoped
+function, since the extracted class method would then be unusable outside that page. Max-errors
+hardcoded `5` (not `10` like the other journals) — preserve that as the parameter default, don't
+silently harmonize to `10`.
 
 **Treasury** (`treasuryjournal.php`): permission check is commented out at the write-action `if`
 (`/* && $user->hasRight(...) */`) but this is confirmed **safe, not a real gap** — the identical
@@ -406,7 +492,9 @@ lint/phpcs/the golden-baseline test with normal-sized fixtures all stayed green,
 class of bug (an error/state flag that used to flow implicitly through shared page scope, now
 needing to be threaded explicitly through a method's return value) is exactly the kind of thing
 a small fixture won't exercise but phpstan's control-flow analysis catches for free — treat it as
-a required step, not an optional extra, for purchases/bank/treasury too.
+a required step, not an optional extra, for treasury too — bank's own extraction needed it twice
+over (see the two bugs documented in the status paragraph near the top of this file), so treat
+this as doubly proven, not a one-off.
 
 ## Phase 4 — Close accounting period (step E) — Implemented
 

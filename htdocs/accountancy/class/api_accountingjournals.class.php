@@ -283,9 +283,11 @@ class AccountingJournals extends DolibarrApi
 	 * Supported journal natures: 1 (various operations, wraps AccountingJournal::getData()+
 	 * writeIntoBookkeeping()), 2 (sells, wraps AccountingJournal::
 	 * writeIntoBookkeepingForSells()), 3 (purchases, wraps AccountingJournal::
-	 * writeIntoBookkeepingForPurchases()), and 5 (expense reports, wraps AccountingJournal::
-	 * writeIntoBookkeepingForExpenseReports()). Other natures are not yet implemented via API -
-	 * see roadmap/backlog.md Phase 3b.
+	 * writeIntoBookkeepingForPurchases()), 4 (bank, wraps AccountingJournal::
+	 * writeIntoBookkeepingForBank() - only when ACCOUNTING_MODE is not 'RECETTES-DEPENSES';
+	 * treasury accounting mode uses a different page/data model not yet implemented via API),
+	 * and 5 (expense reports, wraps AccountingJournal::writeIntoBookkeepingForExpenseReports()).
+	 * Other natures are not yet implemented via API - see roadmap/backlog.md Phase 3b.
 	 *
 	 * @param	int		$id				Accounting journal ID
 	 * @param	array	$request_data	Request data
@@ -300,6 +302,7 @@ class AccountingJournals extends DolibarrApi
 	 * @throws	RestException	400	Bad parameters, or transfer not implemented for this journal's nature
 	 * @throws	RestException	403	Insufficient rights
 	 * @throws	RestException	404	Accounting journal not found
+	 * @throws	RestException	501	Nature is 4 (bank/treasury) but ACCOUNTING_MODE is 'RECETTES-DEPENSES' (treasury not yet implemented via API)
 	 */
 	public function transfer($id, $request_data = null)
 	{
@@ -326,6 +329,14 @@ class AccountingJournals extends DolibarrApi
 			$result = $journal->writeIntoBookkeepingForSells(DolibarrApiAccess::$user, $date_start, $date_end);
 		} elseif ((int) $journal->nature === 3) {
 			$result = $journal->writeIntoBookkeepingForPurchases(DolibarrApiAccess::$user, $date_start, $date_end);
+		} elseif ((int) $journal->nature === 4) {
+			// bankjournal.php and treasuryjournal.php share this same journal row (code='BQ');
+			// which page (and therefore which extracted methods) applies is decided by
+			// ACCOUNTING_MODE, mirroring htdocs/core/menus/standard/eldy.lib.php's own dispatch.
+			if (getDolGlobalString('ACCOUNTING_MODE') == 'RECETTES-DEPENSES') {
+				throw new RestException(501, 'Transfer via API is not yet implemented for treasury accounting mode (nature 4, ACCOUNTING_MODE=RECETTES-DEPENSES); see roadmap/backlog.md Phase 3b');
+			}
+			$result = $journal->writeIntoBookkeepingForBank(DolibarrApiAccess::$user, $date_start, $date_end);
 		} elseif ((int) $journal->nature === 5) {
 			$result = $journal->writeIntoBookkeepingForExpenseReports(DolibarrApiAccess::$user, $date_start, $date_end);
 		} else {
@@ -343,7 +354,8 @@ class AccountingJournals extends DolibarrApi
 	 *
 	 * Kept deliberately simple: a list of pending documents and whether each already carries an
 	 * error flag, not a full trial-balance preview (computing debit/credit subtotals without
-	 * writing would mean re-deriving the write loop's math a second time).
+	 * writing would mean re-deriving the write loop's math a second time). Supports natures 1,
+	 * 2, 3, 4 (bank only - not RECETTES-DEPENSES treasury mode, see transfer()) and 5.
 	 *
 	 * @param	int		$id				Accounting journal ID
 	 * @param	int		$date_start		Start date (timestamp)
@@ -357,6 +369,7 @@ class AccountingJournals extends DolibarrApi
 	 * @throws	RestException	400	Bad parameters, or preview not implemented for this journal's nature
 	 * @throws	RestException	403	Insufficient rights
 	 * @throws	RestException	404	Accounting journal not found
+	 * @throws	RestException	501	Nature is 4 (bank/treasury) but ACCOUNTING_MODE is 'RECETTES-DEPENSES' (treasury not yet implemented via API)
 	 */
 	public function pendingData($id, $date_start = 0, $date_end = 0)
 	{
@@ -389,6 +402,18 @@ class AccountingJournals extends DolibarrApi
 			$data = $journal->getDataForPurchases(DolibarrApiAccess::$user, (int) $date_start, (int) $date_end, 'notyet');
 			foreach ($data['tabfac'] as $key => $val) {
 				$items[] = array('ref' => (string) $val['ref'], 'has_error' => !empty($data['errorforinvoice'][$key]));
+			}
+		} elseif ((int) $journal->nature === 4) {
+			// See transfer() for why nature 4 needs the ACCOUNTING_MODE check.
+			if (getDolGlobalString('ACCOUNTING_MODE') == 'RECETTES-DEPENSES') {
+				throw new RestException(501, 'Preview via API is not yet implemented for treasury accounting mode (nature 4, ACCOUNTING_MODE=RECETTES-DEPENSES); see roadmap/backlog.md Phase 3b');
+			}
+			$data = $journal->getDataForBank(DolibarrApiAccess::$user, (int) $date_start, (int) $date_end, 'notyet');
+			foreach ($data['tabpay'] as $key => $val) {
+				// Bank's data-collection has no pre-existing per-line error map like tabfac/
+				// errorforinvoice does for sells/purchases, so has_error is always false here -
+				// consistent with this endpoint's own "not a full trial-balance preview" scope.
+				$items[] = array('ref' => (string) (!empty($val['ref']) ? $val['ref'] : ''), 'has_error' => false);
 			}
 		} elseif ((int) $journal->nature === 5) {
 			$data = $journal->getDataForExpenseReports(DolibarrApiAccess::$user, (int) $date_start, (int) $date_end, 'notyet');
