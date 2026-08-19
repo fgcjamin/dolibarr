@@ -150,6 +150,66 @@ class AccountingJournal extends CommonObject
 	}
 
 	/**
+	 * Update an existing Accounting Journal.
+	 *
+	 * @param  User	$user the user that updated the journal, currently unused
+	 * @return int  Return integer <0 on error, >0 if OK
+	 */
+	public function update($user)
+	{
+		global $conf;
+
+		$valid_nature = array(1, 2, 3, 4, 5, 8, 9);
+		if (!in_array((int) $this->nature, $valid_nature)) {
+			$this->error = get_class($this)."::update Error invalid field nature '" . strval($this->nature) . "'";
+			dol_syslog($this->error, LOG_ERR);
+			return -1;
+		}
+
+		$sql = "UPDATE ".MAIN_DB_PREFIX."accounting_journal";
+		$sql .= " SET code = '" . $this->db->escape($this->code) . "'";
+		$sql .= ", label = '" . $this->db->escape($this->label) . "'";
+		$sql .= ", nature = " . ((int) $this->nature);
+		$sql .= ", active = " . ((int) $this->active);
+		$sql .= " WHERE rowid = " . ((int) $this->id);
+		$sql .= " AND entity = " . ((int) $conf->entity);
+
+		dol_syslog(get_class($this)."::update", LOG_DEBUG);
+		$resql = $this->db->query($sql);
+		if (!$resql) {
+			$this->error = get_class($this)."::update Error: " . $this->db->lasterror();
+			dol_syslog($this->error, LOG_ERR);
+			return -1;
+		}
+
+		return 1;
+	}
+
+	/**
+	 * Delete an Accounting Journal.
+	 *
+	 * @return int  Return integer <0 on error, >0 if OK
+	 */
+	public function delete()
+	{
+		global $conf;
+
+		$sql = "DELETE FROM ".MAIN_DB_PREFIX."accounting_journal";
+		$sql .= " WHERE rowid = " . ((int) $this->id);
+		$sql .= " AND entity = " . ((int) $conf->entity);
+
+		dol_syslog(get_class($this)."::delete", LOG_DEBUG);
+		$resql = $this->db->query($sql);
+		if (!$resql) {
+			$this->error = get_class($this)."::delete Error: " . $this->db->lasterror();
+			dol_syslog($this->error, LOG_ERR);
+			return -1;
+		}
+
+		return 1;
+	}
+
+	/**
 	 * Load an object from database
 	 *
 	 * @param	int			$rowid			Id of record to load

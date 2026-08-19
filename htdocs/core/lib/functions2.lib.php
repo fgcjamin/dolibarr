@@ -2694,7 +2694,7 @@ function getModuleDirForApiClass($moduleobject)
 		$moduledirforclass = 'mrp';
 	} elseif ($moduleobject == 'workstations') {
 		$moduledirforclass = 'workstation';
-	} elseif ($moduleobject == 'accounting') {
+	} elseif (in_array($moduleobject, array('accounting', 'accountingaccounts', 'accountingjournals', 'accountingsetup'))) {
 		$moduledirforclass = 'accountancy';
 	} elseif ($moduleobject == 'paiements') {
 		$moduledirforclass = 'compta/facture';
