@@ -6,6 +6,12 @@ default accounts, VAT/tax accounting codes) has been implemented — see
 `htdocs/accountancy/class/api_accountingjournals.class.php`,
 `htdocs/accountancy/class/api_accountingsetup.class.php`.
 
+Phase 4 (Close accounting period) has been implemented — see the `fiscalperiods` endpoints added
+to `htdocs/accountancy/class/api_accountancy.class.php` and
+`test/phpunit/AccountingClosureApiTest.php`. Implemented in-file rather than as a separate
+`api_accountingclosure.class.php`, since `api_accountancy.class.php` stayed well under the
+~500-line split threshold.
+
 This backlog covers the remaining phases needed for the accountancy module's REST API to
 fully drive the module end to end (recurring operations: binding, ledger transfer, closure,
 reporting). Each phase is independently mergeable. Phase 3 (ledger transfer) should be done
@@ -83,6 +89,19 @@ bootstrap pattern) covering `bindInvoiceLine()`/`unbindInvoiceLine()`.
 
 **Highest-risk phase — refactor, not reimplementation.**
 
+**Known bug to account for**: `BookKeeping::create()` (`bookkeeping.class.php` ~line 506-508)
+sets `$result = 0` on a *successful* insert instead of returning the new row's id — confirmed
+live against MariaDB while verifying Phase 4. `$this->id` is set correctly, only the return
+value is wrong. Not fixed as part of Phase 4 (out of scope, and this method is squarely Phase
+3's territory — a fix here has to go through the same behavior-preserving-refactor discipline
+as the rest of this phase). Any Phase 3 code that currently branches on `create()`'s return
+value expecting a positive id (rather than checking `< 0` for error / reading `->id` after)
+should be corrected as part of the refactor, and the `BookKeepingTest::testBookKeepingCreate()`
+assertion (`assertLessThan($result, 0)`, i.e. expects `$result > 0`) is likely silently
+succeeding today only because the two args are backwards from what the name suggests. Worth a
+one-line fix (`$result = 0;` → `$result = $id;` or `$result = 1;`) alongside the phase 3 work,
+with its own before/after regression check like everything else in this phase.
+
 `BookKeeping` (`htdocs/accountancy/class/bookkeeping.class.php`) already has full
 CRUD/list/balance (`create`, `createFromValues`, `createStd`, `fetch*`, `update*`, `delete*`,
 `export_bookkeeping`, `transformTransaction`, `canModifyBookkeeping`, `validBookkeepingDate`,
@@ -155,7 +174,7 @@ each `writeIntoBookkeepingFor*()` against fixture invoices/payments/expense repo
 including the edge-case branches visible in the current inline code (e.g. sells-journal
 replaced-invoice/retained-warranty handling) so a careless extraction can't silently drop them.
 
-## Phase 4 — Close accounting period (step E)
+## Phase 4 — Close accounting period (step E) — Implemented
 
 Lower risk: wraps 3 already-correct, already-sequenced `BookKeeping` methods, mirroring
 `htdocs/accountancy/closure/index.php`'s 3-step wizard (`confirm_step_1`→

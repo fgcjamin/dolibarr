@@ -236,6 +236,9 @@ class Fiscalyear extends CommonObject
 		$result = $this->db->query($sql);
 		if ($result) {
 			$obj = $this->db->fetch_object($result);
+			if (!$obj) {
+				return 0;
+			}
 
 			$this->id = $obj->rowid;
 			$this->ref = $obj->rowid;

@@ -55,6 +55,7 @@ class Accountancy extends DolibarrApi
 
 		require_once DOL_DOCUMENT_ROOT.'/accountancy/class/bookkeeping.class.php';
 		require_once DOL_DOCUMENT_ROOT.'/accountancy/class/accountancyexport.class.php';
+		require_once DOL_DOCUMENT_ROOT.'/core/class/fiscalyear.class.php';
 
 		$langs->load('accountancy');
 
@@ -274,5 +275,207 @@ class Accountancy extends DolibarrApi
 				exit();
 			}
 		}
+	}
+
+	/**
+	 * Get list of fiscal periods (accounting closure periods), ordered by start date
+	 *
+	 * @return  array<array{id:int,label:string,date_start:int,date_end:int,status:int}>
+	 *
+	 * @url     GET fiscalperiods
+	 *
+	 * @throws  RestException  403  Insufficient rights
+	 * @throws  RestException  503  Error while fetching fiscal periods
+	 */
+	public function getFiscalPeriods()
+	{
+		if (!DolibarrApiAccess::$user->hasRight('accounting', 'fiscalyear', 'write') && !DolibarrApiAccess::$user->hasRight('accounting', 'mouvements', 'lire')) {
+			throw new RestException(403, 'No permission to read fiscal periods');
+		}
+
+		$list = $this->bookkeeping->getFiscalPeriods();
+		if (!is_array($list)) {
+			throw new RestException(503, 'Error while fetching fiscal periods: '.$this->bookkeeping->errorsToString());
+		}
+
+		return array_values($list);
+	}
+
+	/**
+	 * Get a fiscal period (accounting closure period) by ID
+	 *
+	 * @param   int     $id     Fiscal period ID
+	 * @return  Object
+	 *
+	 * @url     GET fiscalperiods/{id}
+	 *
+	 * @throws  RestException  403  Insufficient rights
+	 * @throws  RestException  404  Fiscal period not found
+	 */
+	public function getFiscalPeriod($id)
+	{
+		if (!DolibarrApiAccess::$user->hasRight('accounting', 'fiscalyear', 'write') && !DolibarrApiAccess::$user->hasRight('accounting', 'mouvements', 'lire')) {
+			throw new RestException(403, 'No permission to read fiscal periods');
+		}
+
+		$fiscalyear = $this->_fetchFiscalPeriod($id);
+
+		return $this->_cleanObjectDatas($fiscalyear);
+	}
+
+	/**
+	 * Validate all bookkeeping movements of a fiscal period between two dates
+	 * (step 1 of the accounting closure wizard, see accountancy/closure/index.php)
+	 *
+	 * @param   int     $id             Fiscal period ID
+	 * @param   int     $date_start     Date start (timestamp)
+	 * @param   int     $date_end       Date end (timestamp)
+	 * @return  Object
+	 *
+	 * @url     POST fiscalperiods/{id}/validate
+	 *
+	 * @throws  RestException  400  Bad parameters
+	 * @throws  RestException  403  Insufficient rights
+	 * @throws  RestException  404  Fiscal period not found
+	 * @throws  RestException  409  Fiscal period is already closed
+	 * @throws  RestException  500  Error while validating movements
+	 */
+	public function validateFiscalPeriod($id, $date_start, $date_end)
+	{
+		if (!DolibarrApiAccess::$user->hasRight('accounting', 'fiscalyear', 'write')) {
+			throw new RestException(403, 'No permission to close accounting periods');
+		}
+
+		if (empty($date_start) || empty($date_end)) {
+			throw new RestException(400, 'date_start and date_end are mandatory');
+		}
+
+		$fiscalyear = $this->_fetchFiscalPeriod($id);
+		if ($fiscalyear->status == Fiscalyear::STATUS_CLOSED) {
+			throw new RestException(409, 'Fiscal period is already closed, movements can no longer be validated');
+		}
+
+		$result = $this->bookkeeping->validateMovementForFiscalPeriod($date_start, $date_end);
+		if ($result < 0) {
+			throw new RestException(500, 'Error while validating movements: '.$this->bookkeeping->errorsToString());
+		}
+
+		$fiscalyear = $this->_fetchFiscalPeriod($id);
+
+		return $this->_cleanObjectDatas($fiscalyear);
+	}
+
+	/**
+	 * Close a fiscal period, optionally generating closure bookkeeping records
+	 * (step 2 of the accounting closure wizard, see accountancy/closure/index.php)
+	 *
+	 * @param   int     $id                             Fiscal period ID
+	 * @param   int     $new_fiscal_period_id           New fiscal period ID (movements resume into this one)
+	 * @param   int     $separate_auxiliary_account     1 to separate auxiliary (subledger) accounts, 0 otherwise
+	 * @param   int     $generate_bookkeeping_records   1 to generate closure bookkeeping records, 0 otherwise
+	 * @return  Object
+	 *
+	 * @url     POST fiscalperiods/{id}/close
+	 *
+	 * @throws  RestException  400  Bad parameters
+	 * @throws  RestException  403  Insufficient rights
+	 * @throws  RestException  404  Fiscal period not found
+	 * @throws  RestException  409  Fiscal period is already closed, or unvalidated movements remain
+	 * @throws  RestException  500  Error while closing fiscal period
+	 */
+	public function closeFiscalPeriod($id, $new_fiscal_period_id, $separate_auxiliary_account = 0, $generate_bookkeeping_records = 1)
+	{
+		if (!DolibarrApiAccess::$user->hasRight('accounting', 'fiscalyear', 'write')) {
+			throw new RestException(403, 'No permission to close accounting periods');
+		}
+
+		if (empty($new_fiscal_period_id)) {
+			throw new RestException(400, 'new_fiscal_period_id is mandatory');
+		}
+
+		$fiscalyear = $this->_fetchFiscalPeriod($id);
+		if ($fiscalyear->status == Fiscalyear::STATUS_CLOSED) {
+			throw new RestException(409, 'Fiscal period is already closed');
+		}
+
+		$count_by_month = $this->bookkeeping->getCountByMonthForFiscalPeriod((int) $fiscalyear->date_start, (int) $fiscalyear->date_end);
+		if (!is_array($count_by_month)) {
+			throw new RestException(500, 'Error while checking unvalidated movements: '.$this->bookkeeping->errorsToString());
+		}
+		if (!empty($count_by_month['total']) && !getDolGlobalString('ACCOUNTANCY_DISABLE_CLOSURE_LINE_BY_LINE')) {
+			throw new RestException(409, 'Some bookkeeping movements of this fiscal period are not yet validated');
+		}
+
+		$result = $this->bookkeeping->closeFiscalPeriod($id, $new_fiscal_period_id, (bool) $separate_auxiliary_account, (bool) $generate_bookkeeping_records);
+		if ($result < 0) {
+			throw new RestException(500, 'Error while closing fiscal period: '.$this->bookkeeping->errorsToString());
+		}
+
+		$fiscalyear = $this->_fetchFiscalPeriod($id);
+
+		return $this->_cleanObjectDatas($fiscalyear);
+	}
+
+	/**
+	 * Insert accounting reversal entries into the inventory journal of the new fiscal period
+	 * (step 3 of the accounting closure wizard, see accountancy/closure/index.php)
+	 *
+	 * @param   int     $id                     Fiscal period ID (must already be closed)
+	 * @param   int     $inventory_journal_id   Inventory journal ID
+	 * @param   int     $new_fiscal_period_id   New fiscal period ID
+	 * @param   int     $date_start             Date start (timestamp)
+	 * @param   int     $date_end               Date end (timestamp)
+	 * @return  Object
+	 *
+	 * @url     POST fiscalperiods/{id}/reversal
+	 *
+	 * @throws  RestException  400  Bad parameters
+	 * @throws  RestException  403  Insufficient rights
+	 * @throws  RestException  404  Fiscal period not found
+	 * @throws  RestException  409  Fiscal period is not closed yet
+	 * @throws  RestException  500  Error while inserting accounting reversal
+	 */
+	public function reversalFiscalPeriod($id, $inventory_journal_id, $new_fiscal_period_id, $date_start, $date_end)
+	{
+		if (!DolibarrApiAccess::$user->hasRight('accounting', 'fiscalyear', 'write')) {
+			throw new RestException(403, 'No permission to close accounting periods');
+		}
+
+		if (empty($inventory_journal_id) || empty($new_fiscal_period_id) || empty($date_start) || empty($date_end)) {
+			throw new RestException(400, 'inventory_journal_id, new_fiscal_period_id, date_start and date_end are mandatory');
+		}
+
+		$fiscalyear = $this->_fetchFiscalPeriod($id);
+		if ($fiscalyear->status != Fiscalyear::STATUS_CLOSED) {
+			throw new RestException(409, 'Fiscal period must be closed before inserting the accounting reversal');
+		}
+
+		$result = $this->bookkeeping->insertAccountingReversal($id, $inventory_journal_id, $new_fiscal_period_id, $date_start, $date_end);
+		if ($result < 0) {
+			throw new RestException(500, 'Error while inserting accounting reversal: '.$this->bookkeeping->errorsToString());
+		}
+
+		$fiscalyear = $this->_fetchFiscalPeriod($id);
+
+		return $this->_cleanObjectDatas($fiscalyear);
+	}
+
+	/**
+	 * Fetch a fiscal period by id or throw a 404
+	 *
+	 * @param   int         $id     Fiscal period ID
+	 * @return  Fiscalyear
+	 *
+	 * @throws  RestException  404  Fiscal period not found
+	 */
+	private function _fetchFiscalPeriod($id)
+	{
+		$fiscalyear = new Fiscalyear($this->db);
+		$result = $fiscalyear->fetch($id);
+		if ($result <= 0) {
+			throw new RestException(404, 'Fiscal period not found');
+		}
+
+		return $fiscalyear;
 	}
 }
