@@ -6,8 +6,8 @@ Phases 1-5 are implemented and cover the 9-step setup workflow and the 5-step re
 (binding → ledger transfer → closure/reporting) described in the original request — a Dolibarr
 install can be driven through the accountancy module end to end via the API alone, with no UI step
 required. Phases 6-11 are a follow-up backlog written after auditing what's still missing beyond
-that core workflow (see `roadmap/API_GAPS.md` for the source analysis) — Phases 6, 7, and 8 are
-implemented; Phases 9, 10, and 11 are scoped but open.
+that core workflow (see `roadmap/API_GAPS.md` for the source analysis) — Phases 6, 7, 8, and 9 are
+implemented; Phases 10 and 11 are scoped but open.
 
 | Phase | Scope | Status | Key files |
 |---|---|---|---|
@@ -20,7 +20,7 @@ implemented; Phases 9, 10, and 11 are scoped but open.
 | 6 | Chart-of-accounts model CRUD (step 2) | Done | `accountancysystem.class.php` (`update`/`delete`), `api_accountingsetup.class.php` (`accountingsystems` POST/PUT/DELETE) |
 | 7 | Activate a chart of accounts (step 3, "select" half) | Done | `accountancysystem.class.php` (`activate()`), `api_accountingsetup.class.php` (`accountingsystems/{id}/activate[/preview]`) |
 | 8 | Accounting account categories CRUD + assignment | Done | `accountancycategory.class.php` (bug fix in `create()`), new `api_accountingcategories.class.php` |
-| 9 | Ledger-transfer preview amounts (step C enhancement) | Open | `api_accountingjournals.class.php` (`pendingData()`) |
+| 9 | Ledger-transfer preview amounts (step C enhancement) | Done | `accountingjournal.class.php` (`getPreviewAmountsForSells()`/`getPreviewAmountsForPurchases()`), `api_accountingjournals.class.php` (`pendingData()`) |
 | 10 | Product accountancy codes under `MAIN_PRODUCT_PERENTITY_SHARED` | Open — needs research first | `product.class.php`, `api_products.class.php` |
 | 11 | Chart-of-accounts CSV import | Open | `accountancyimport.class.php`, `modAccounting.class.php` import profiles |
 
@@ -841,25 +841,83 @@ sessions, not a per-script workaround. Also note for future fixtures in this cod
 model methods (including `updateAccAcc()`, `getCptsCat()`) filter on `active = 1`, so any fixture
 account meant to participate in category/journal logic must set `->active = 1` before `create()`.
 
-## Phases 9-11 — Remaining API_GAPS.md items — Open, scoped not implemented
+## Phase 9 — Ledger-transfer preview amounts (step C enhancement) — Implemented
 
-Each of these was deliberately left out of Phases 6, 7, and 8 for a concrete reason (risk, an
+Closes the "Missing" item from `roadmap/API_GAPS.md`'s summary table:
+`AccountingJournals::pendingData()` (`api_accountingjournals.class.php:353-433`) used to return
+only `ref`/`has_error` per pending document for natures 2 (sells) and 3 (purchases), with a
+docblock claiming real subtotals would mean re-deriving the write loop's math a second time.
+Scoping this phase confirmed that claim was overstated for these two natures:
+`getDataForSells()`/`getDataForPurchases()` already collect per-invoice, per-account-bucketed
+arrays (`tabht`/`tabtva`/`tablocaltax1`/`tablocaltax2`/`tabttc`, plus `tabwarranty`/
+`tabrevenuestamp` for sells and `tabother`/`tabrctva`/`tabrclocaltax1`/`tabrclocaltax2` for
+purchases), and both `writeIntoBookkeepingForSells()`/`writeIntoBookkeepingForPurchases()`'s
+debit/credit derivation from those arrays is a pure sign-split (`debit = max($mt,0)`,
+`credit = max(-$mt,0)`, or the inverted rule per bucket) with no DB dependency. Nature 4
+(bank/treasury) and nature 1 (various)/5 (expense reports) stay exactly as before — neither has a
+comparable per-line tab-array structure to aggregate cheaply.
+
+**Model**: two new read-only aggregator methods on `AccountingJournal`
+(`htdocs/accountancy/class/accountingjournal.class.php`), each inserted right after its
+`getDataForXxx()` sibling: `getPreviewAmountsForSells(array $data)` and
+`getPreviewAmountsForPurchases(array $data)`. Both take the array already returned by
+`getDataForSells()`/`getDataForPurchases()` (no re-querying) and return, per invoice,
+`total_ht`/`total_ttc` (plain sums of `tabht`/`tabttc`) and `total_debit`/`total_credit` (the
+actual amounts the write would post, folding in every bucket with that write method's exact
+per-bucket sign convention — verified bucket-by-bucket against the real code, not assumed).
+Purchases' aggregator additionally replicates the write method's VAT reverse-charge substitution
+verbatim (swap `tabtva`/`tablocaltax1`/`tablocaltax2` for `tabrctva`/`tabrclocaltax1`/
+`tabrclocaltax2` when the normal bucket is all-zero and country/force-flag conditions hold) —
+this is the one place the "trivial sign split" framing undersold the actual complexity, so it's
+covered by a dedicated synthetic test (see Tests below) rather than left to the simple baseline
+fixture, which has reverse-charge switched off. Both methods are pure functions: no `$this->db`
+query, no `BookKeeping` object construction, no `create()`/`begin()`/`commit()` call.
+
+**API**: `AccountingJournals::pendingData()` (`htdocs/accountancy/class/api_accountingjournals.class.php`)
+now calls the matching new aggregator for natures 2/3 and adds `total_ht`/`total_ttc`/
+`total_debit`/`total_credit` to each item. Two deliberate zeroing decisions, applied at the API
+layer rather than inside the aggregator (keeping the aggregator a pure "what the tab-arrays say"
+function, with the business rule of "don't show a subtotal for something that won't cleanly
+transfer" applied one layer up, the same way `has_error` itself is already computed above
+`getDataForSells()`, not inside it):
+- The 4 fields are forced to `0.0` for an invoice that already `has_error`.
+- The 4 fields are also forced to `0.0` for a replaced-but-not-yet-dispatched invoice
+  (`close_code == Facture::CLOSECODE_REPLACED`/`FactureFournisseur::CLOSECODE_REPLACED`) — a real
+  gap this phase surfaced: `writeIntoBookkeepingForSells()`/`writeIntoBookkeepingForPurchases()`
+  silently skip this case entirely (0 bookkeeping rows), but it was never flagged by
+  `errorforinvoice`, so an unguarded preview would show a plausible non-zero subtotal for a
+  transfer that actually produces nothing. Small, isolated, API-layer-only addition — no change
+  to either write method.
+
+Natures 1, 4, and 5 (unchanged) now add the same 4 keys to each item set to `null`, so `items`
+keeps one uniform shape across every nature — a client checks for `null` rather than branching on
+`nature` to know which fields apply.
+
+**Tests**: extended `test/phpunit/AccountingJournalSellsTransferTest.php` and
+`AccountingJournalPurchasesTransferTest.php` with a self-consistency test each
+(`testGetPreviewAmountsForSellsMatchesWrite()`/`testGetPreviewAmountsForPurchasesMatchesWrite()`,
+fiscal years 2960/2961) — capture the preview *before* calling `writeIntoBookkeepingForXxx()`,
+then assert the actually-written `SUM(debit)`/`SUM(credit)` in `llx_accounting_bookkeeping` match
+the captured preview values. The purchases file also gets two synthetic unit tests
+(`testGetPreviewAmountsForPurchasesVatReverseCharge()`/`testGetPreviewAmountsForPurchasesVatNpr()`)
+that hand-build a `$data` array literal and call `getPreviewAmountsForPurchases()` directly, no DB
+fixture at all — the only practical way to exercise the reverse-charge-substitution and
+NPR-counterpart branches, which the simple baseline fixture (reverse-charge and NPR both switched
+off, same simplification the original purchases write-method slice used) never triggers. All 8
+tests across both files pass via the phpunit 9.5 phar (`AccountingJournalSellsTransferTest.php`:
+3 tests/38 assertions; `AccountingJournalPurchasesTransferTest.php`: 5 tests/48 assertions). The
+two new `pendingData()` code paths (plus a nature-1 regression check) were additionally verified
+with a live smoke test (direct instantiation against the real test DB, matching the Phase 6/7/8
+pattern, wrapped in its own manual `$db->begin()`/`rollback()`) — all passed. `phpstan` (level 10,
+via the CI-matching `bootstrap_action.php` bootstrap) passes clean on both modified production
+files; running it against the two modified test files surfaces only pre-existing PHPUnit-stub
+noise (confirmed identical on an untouched sibling test file), nothing specific to the new code.
+
+## Phases 10-11 — Remaining API_GAPS.md items — Open, scoped not implemented
+
+Each of these was deliberately left out of Phases 6, 7, 8, and 9 for a concrete reason (risk, an
 unresolved signature mismatch, unconfirmed correctness, or no precedent to build on in this
 codebase) — see `roadmap/API_GAPS.md` for the original gap analysis this backlog is closing out.
-
-**Phase 9 — Ledger-transfer preview amounts (step C enhancement).** `AccountingJournals::pendingData()`
-(`api_accountingjournals.class.php:353-433`) currently returns only `ref`/`has_error` per pending
-document for natures 2/3, with a docblock claiming real subtotals would mean re-deriving the write
-loop's math. Confirmed during scoping this backlog that the claim is overstated for sells/
-purchases: `getDataForSells()`/`getDataForPurchases()` already return per-invoice,
-per-account-bucketed arrays (`tabht`/`tabtva`/`tablocaltax1`/`tablocaltax2`/`tabttc`, plus
-`tabwarranty` for sells), and `writeIntoBookkeepingForSells()`'s debit/credit derivation from
-those arrays is a trivial sign split (`debit = max($mt,0)`, `credit = max(-$mt,0)`) needing no DB
-writes to compute. A preview aggregator can sum these existing tab arrays per invoice directly —
-lower risk than the original gap analysis assumed, but still touches the ledger-transfer preview
-path, so apply the same golden-baseline verification discipline Phase 3b used, and keep bank/
-treasury (nature 4) as `has_error => false`/no-subtotal as today since neither has a comparable
-per-line tab-array structure to aggregate.
 
 **Phase 10 — Product accountancy codes under `MAIN_PRODUCT_PERENTITY_SHARED`.** A narrow `PUT
 products/{id}/accountancycodes` wrapping `Product::setAccountancyCode($type, $value)`
@@ -887,11 +945,13 @@ file under the admin temp dir (mirroring the wizard's own upload step), and driv
 generic `Import` class (`htdocs/imports/class/import.class.php`) reusing the `Chartofaccounts`
 profile rather than reimplementing column mapping/validation.
 
-## Critical files (Phases 1-8)
+## Critical files (Phases 1-9)
 
 - `htdocs/accountancy/class/bookkeeping.class.php`
 - `htdocs/accountancy/class/lettering.class.php`
-- `htdocs/accountancy/class/accountingjournal.class.php`
+- `htdocs/accountancy/class/accountingjournal.class.php` (`getPreviewAmountsForSells()`/
+  `getPreviewAmountsForPurchases()` added in Phase 9)
+- `htdocs/accountancy/class/api_accountingjournals.class.php` (`pendingData()` extended in Phase 9)
 - `htdocs/accountancy/class/accountancysystem.class.php` (`activate()` added in Phase 7)
 - `htdocs/accountancy/class/accountancycategory.class.php` (bug fix in `create()` in Phase 8)
 - `htdocs/accountancy/class/api_accountingcategories.class.php` (new in Phase 8)

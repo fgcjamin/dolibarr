@@ -209,6 +209,94 @@ class AccountingJournalSellsTransferTest extends CommonClassTest
 	}
 
 	/**
+	 * Phase 9: AccountingJournal::getPreviewAmountsForSells() must, computed BEFORE any write,
+	 * match what writeIntoBookkeepingForSells() actually posts to the ledger afterward - the
+	 * whole point of a "preview" is that it's trustworthy.
+	 *
+	 * @return void
+	 */
+	public function testGetPreviewAmountsForSellsMatchesWrite()
+	{
+		global $conf,$user,$langs,$db;
+		$conf = $this->savconf;
+		$user = $this->savuser;
+		$langs = $this->savlangs;
+		$db = $this->savdb;
+
+		$year = 2960;
+
+		$period = new Fiscalyear($db);
+		$period->label = 'AccountingJournalSellsTransferTest preview period '.$year;
+		$period->date_start = dol_mktime(0, 0, 0, 1, 1, $year);
+		$period->date_end = dol_mktime(23, 59, 59, 12, 31, $year);
+		$period_id = $period->create($user);
+		$this->assertGreaterThan(0, $period_id, $period->errorsToString());
+		unset($conf->cache['active_fiscal_period_cached']);
+
+		$sql = "SELECT rowid, pcg_version FROM ".MAIN_DB_PREFIX."accounting_system WHERE pcg_version = 'PCG25-DEV'";
+		$res = $db->query($sql);
+		$chart = $db->fetch_object($res);
+		$conf->global->CHARTOFACCOUNTS = (int) $chart->rowid;
+		$conf->global->ACCOUNTING_ACCOUNT_CUSTOMER = '411999';
+		$conf->global->ACCOUNTING_VAT_SOLD_ACCOUNT = '445999';
+		$conf->global->ACCOUNTING_PRODUCT_SOLD_ACCOUNT = '707999';
+
+		$this->seedAccount($db, $chart->pcg_version, '411999', 'AccountingJournalSellsTransferTest customer control');
+		$acctProductId = $this->seedAccount($db, $chart->pcg_version, '707999', 'AccountingJournalSellsTransferTest product sales');
+		$this->seedAccount($db, $chart->pcg_version, '445999', 'AccountingJournalSellsTransferTest VAT');
+
+		$dateLine = dol_mktime(12, 0, 0, 6, 15, $year);
+
+		$soc = new Societe($db);
+		$soc->name = 'AccountingJournalSellsTransferTest preview customer';
+		$soc->client = 1;
+		$soc->code_client = -1;
+		$socId = $soc->create($user);
+		$this->assertGreaterThan(0, $socId, (string) $soc->error);
+
+		$fac = new Facture($db);
+		$fac->socid = $socId;
+		$fac->date = $dateLine;
+		$fac->type = Facture::TYPE_STANDARD;
+		$facId = $fac->create($user);
+		$this->assertGreaterThan(0, $facId, (string) $fac->error);
+
+		$lineId = $fac->addline('AccountingJournalSellsTransferTest preview line', 100, 1, 20, 0, 0, 0, 0, '', '', $acctProductId);
+		$this->assertGreaterThan(0, $lineId, (string) $fac->error);
+
+		$valResult = $fac->validate($user);
+		$this->assertGreaterThanOrEqual(0, $valResult, (string) $fac->error);
+
+		$journal = new AccountingJournal($db);
+		$sql = "SELECT rowid FROM ".MAIN_DB_PREFIX."accounting_journal WHERE nature = 2 AND entity = ".((int) $conf->entity);
+		$res = $db->query($sql);
+		$obj = $db->fetch_object($res);
+		$journal->fetch((int) $obj->rowid);
+
+		$date_start = dol_mktime(0, 0, 0, 1, 1, $year);
+		$date_end = dol_mktime(23, 59, 59, 12, 31, $year);
+
+		// Capture the preview BEFORE writing anything.
+		$data = $journal->getDataForSells($user, $date_start, $date_end, 'notyet');
+		$preview = $journal->getPreviewAmountsForSells($data);
+		$this->assertArrayHasKey($facId, $preview);
+		$this->assertEqualsWithDelta(100.0, $preview[$facId]['total_ht'], 0.01);
+		$this->assertEqualsWithDelta(120.0, $preview[$facId]['total_ttc'], 0.01);
+		$this->assertEqualsWithDelta(120.0, $preview[$facId]['total_debit'], 0.01);
+		$this->assertEqualsWithDelta(120.0, $preview[$facId]['total_credit'], 0.01);
+
+		$result = $journal->writeIntoBookkeepingForSells($user, $date_start, $date_end);
+		$this->assertGreaterThan(0, $result, implode(',', $journal->errors));
+
+		$sql = "SELECT SUM(debit) as d, SUM(credit) as c FROM ".MAIN_DB_PREFIX."accounting_bookkeeping";
+		$sql .= " WHERE doc_type = 'customer_invoice' AND fk_doc = ".((int) $facId);
+		$res = $db->query($sql);
+		$obj = $db->fetch_object($res);
+		$this->assertEqualsWithDelta($preview[$facId]['total_debit'], (float) $obj->d, 0.01, 'Preview total_debit must match what was actually written');
+		$this->assertEqualsWithDelta($preview[$facId]['total_credit'], (float) $obj->c, 0.01, 'Preview total_credit must match what was actually written');
+	}
+
+	/**
 	 * A "replaced" invoice (close_code == Facture::CLOSECODE_REPLACED, not yet dispatched)
 	 * must be silently skipped by writeIntoBookkeepingForSells() - no bookkeeping rows, no
 	 * error counted.

@@ -2382,6 +2382,76 @@ class AccountingJournal extends CommonObject
 	}
 
 	/**
+	 * Compute per-invoice preview subtotals from an already-collected getDataForSells() return
+	 * array, without writing anything to the bookkeeping. Read-only re-derivation of
+	 * writeIntoBookkeepingForSells()'s 5-block sign logic (warranty, thirdparty/ttc, product/
+	 * service, VAT+localtax1+localtax2, revenue stamp) - no BookKeeping object is built, no
+	 * create()/begin()/commit() call is made. Keep this in sync with
+	 * writeIntoBookkeepingForSells() if that method's sign conventions ever change.
+	 *
+	 * total_ht/total_ttc are plain business-readable sums of tabht/tabttc (warranty and revenue
+	 * stamp are deliberately excluded from these two, matching how tabttc is only ever used in
+	 * the thirdparty block). total_debit/total_credit are the actual amounts the write would
+	 * post, folding in all 5 buckets - they should be equal for any invoice that would transfer
+	 * cleanly.
+	 *
+	 * @param	array	$data	Return value of getDataForSells()
+	 * @phan-param array{tabfac:array<int,array{date:int,datereg:int,ref:string,type:int,description:string,close_code:string,revenuestamp:float}>,tabht:array<int,array<string,float>>,tabtva:array<int,array<string,float>>,def_tva:array<int,array<string,array<string,string>>>,tabwarranty:array<int,array<string,float>>,tabrevenuestamp:array<int,array<string,float>>,tabttc:array<int,array<string,float>>,tablocaltax1:array<int,array<string,float>>,tablocaltax2:array<int,array<string,float>>,tabcompany:array<int,array{id:int,name:string,code_client:string,accountancy_code_customer_general:string,code_compta:string}>,errorforinvoice:array<int,string>,error:int} $data
+	 * @phpstan-param array{tabfac:array<int,array{date:int,datereg:int,ref:string,type:int,description:string,close_code:string,revenuestamp:float}>,tabht:array<int,array<string,float>>,tabtva:array<int,array<string,float>>,def_tva:array<int,array<string,array<string,string>>>,tabwarranty:array<int,array<string,float>>,tabrevenuestamp:array<int,array<string,float>>,tabttc:array<int,array<string,float>>,tablocaltax1:array<int,array<string,float>>,tablocaltax2:array<int,array<string,float>>,tabcompany:array<int,array{id:int,name:string,code_client:string,accountancy_code_customer_general:string,code_compta:string}>,errorforinvoice:array<int,string>,error:int} $data
+	 * @return	array<int,array{total_ht:float,total_ttc:float,total_debit:float,total_credit:float}>	Keyed by the same invoice id as $data['tabfac']
+	 */
+	public function getPreviewAmountsForSells(array $data)
+	{
+		$result = array();
+		foreach ($data['tabfac'] as $key => $val) {
+			$totalht = array_sum($data['tabht'][$key]);
+			$totalttc = array_sum($data['tabttc'][$key]);
+			$totaldebit = 0.0;
+			$totalcredit = 0.0;
+
+			// Warranty - debit-positive (mirrors writeIntoBookkeepingForSells()'s warranty block)
+			if (!empty($data['tabwarranty'][$key]) && is_array($data['tabwarranty'][$key])) {
+				foreach ($data['tabwarranty'][$key] as $mt) {
+					$totaldebit += max($mt, 0);
+					$totalcredit += max(-$mt, 0);
+				}
+			}
+			// Thirdparty/ttc - debit-positive
+			foreach ($data['tabttc'][$key] as $mt) {
+				$totaldebit += max($mt, 0);
+				$totalcredit += max(-$mt, 0);
+			}
+			// Product/service - credit-positive
+			foreach ($data['tabht'][$key] as $mt) {
+				$totaldebit += max(-$mt, 0);
+				$totalcredit += max($mt, 0);
+			}
+			// VAT + localtax1 + localtax2 - credit-positive
+			foreach (array($data['tabtva'][$key], $data['tablocaltax1'][$key], $data['tablocaltax2'][$key]) as $arrayofvat) {
+				foreach ($arrayofvat as $mt) {
+					$totaldebit += max(-$mt, 0);
+					$totalcredit += max($mt, 0);
+				}
+			}
+			// Revenue stamp - credit-positive
+			if (!empty($data['tabrevenuestamp'][$key]) && is_array($data['tabrevenuestamp'][$key])) {
+				foreach ($data['tabrevenuestamp'][$key] as $mt) {
+					$totaldebit += max(-$mt, 0);
+					$totalcredit += max($mt, 0);
+				}
+			}
+
+			$result[$key] = array(
+				'total_ht' => (float) price2num($totalht, 'MT'),
+				'total_ttc' => (float) price2num($totalttc, 'MT'),
+				'total_debit' => (float) price2num($totaldebit, 'MT'),
+				'total_credit' => (float) price2num($totalcredit, 'MT'),
+			);
+		}
+		return $result;
+	}
+
+	/**
 	 * Write the sells journal (nature=2) into the bookkeeping.
 	 * Pure mechanical lift of accountancy/journal/sellsjournal.php's former inline
 	 * writebookkeeping action block. No hook is fired here - the original block had none.
@@ -3139,6 +3209,103 @@ class AccountingJournal extends CommonObject
 			'errorforinvoice' => $errorforinvoice,
 			'error' => $toomanylineserror,
 		);
+	}
+
+	/**
+	 * Compute per-invoice preview subtotals from an already-collected getDataForPurchases()
+	 * return array, without writing anything to the bookkeeping. Read-only re-derivation of
+	 * writeIntoBookkeepingForPurchases()'s 4-block sign logic (thirdparty/ttc, product/service,
+	 * VAT+localtax1+localtax2 with the reverse-charge substitution, VAT-NPR counterpart) - no
+	 * BookKeeping object is built, no create()/begin()/commit() call is made. Keep this in sync
+	 * with writeIntoBookkeepingForPurchases() if that method's sign conventions or reverse-charge
+	 * substitution logic ever change.
+	 *
+	 * total_ht/total_ttc are plain business-readable sums of tabht/tabttc. total_debit/
+	 * total_credit are the actual amounts the write would post, folding in all 4 buckets (plus
+	 * the reverse-charge/NPR counterparts) - they should be equal for any invoice that would
+	 * transfer cleanly.
+	 *
+	 * @param	array	$data	Return value of getDataForPurchases()
+	 * @phan-param array{tabfac:array<int,array{date:int,datereg:int,ref:string,refsologest:string,refsuppliersologest:string,type:int,description:string,close_code:string}>,tabht:array<int,array<string,float>>,tabtva:array<int,array<string,float>>,def_tva:array<int,array<string,array<string,string>>>,tabttc:array<int,array<string,float>>,tablocaltax1:array<int,array<string,float>>,tablocaltax2:array<int,array<string,float>>,tabcompany:array<int,array{id:int,name:string,code_fournisseur:string,accountancy_code_supplier_general:string,code_compta_fournisseur:string}>,tabother:array<int,array<string,float>>,tabrctva:array<int,array<string,float>>,tabrclocaltax1:array<int,array<string,float>>,tabrclocaltax2:array<int,array<string,float>>,errorforinvoice:array<int,string>,error:int} $data
+	 * @phpstan-param array{tabfac:array<int,array{date:int,datereg:int,ref:string,refsologest:string,refsuppliersologest:string,type:int,description:string,close_code:string}>,tabht:array<int,array<string,float>>,tabtva:array<int,array<string,float>>,def_tva:array<int,array<string,array<string,string>>>,tabttc:array<int,array<string,float>>,tablocaltax1:array<int,array<string,float>>,tablocaltax2:array<int,array<string,float>>,tabcompany:array<int,array{id:int,name:string,code_fournisseur:string,accountancy_code_supplier_general:string,code_compta_fournisseur:string}>,tabother:array<int,array<string,float>>,tabrctva:array<int,array<string,float>>,tabrclocaltax1:array<int,array<string,float>>,tabrclocaltax2:array<int,array<string,float>>,errorforinvoice:array<int,string>,error:int} $data
+	 * @return	array<int,array{total_ht:float,total_ttc:float,total_debit:float,total_credit:float}>	Keyed by the same invoice id as $data['tabfac']
+	 */
+	public function getPreviewAmountsForPurchases(array $data)
+	{
+		global $mysoc;
+
+		$result = array();
+		foreach ($data['tabfac'] as $key => $val) {
+			$totalht = array_sum($data['tabht'][$key]);
+			$totalttc = array_sum($data['tabttc'][$key]);
+			$totaldebit = 0.0;
+			$totalcredit = 0.0;
+
+			// Thirdparty/ttc - credit-positive (inverted vs. sells)
+			foreach ($data['tabttc'][$key] as $mt) {
+				$totalcredit += max($mt, 0);
+				$totaldebit += max(-$mt, 0);
+			}
+			// Product/service - debit-positive
+			foreach ($data['tabht'][$key] as $mt) {
+				$totaldebit += max($mt, 0);
+				$totalcredit += max(-$mt, 0);
+			}
+			// VAT + localtax1 + localtax2, with reverse-charge substitution - debit-positive
+			// (mirrors writeIntoBookkeepingForPurchases()'s VAT block verbatim)
+			foreach (array(0, 1, 2) as $numtax) {
+				$arrayofvat = $data['tabtva'];
+				$rcarray = $data['tabrctva'];
+				if ($numtax == 1) {
+					$arrayofvat = $data['tablocaltax1'];
+					$rcarray = $data['tabrclocaltax1'];
+				}
+				if ($numtax == 2) {
+					$arrayofvat = $data['tablocaltax2'];
+					$rcarray = $data['tabrclocaltax2'];
+				}
+
+				if ($mysoc->country_code == 'FR' || getDolGlobalString('ACCOUNTING_FORCE_ENABLE_VAT_REVERSE_CHARGE')) {
+					$has_vat = false;
+					foreach ($arrayofvat[$key] as $mt) {
+						if ($mt) {
+							$has_vat = true;
+						}
+					}
+
+					if (!$has_vat) {
+						$arrayofvat = $rcarray;
+						if (!isset($arrayofvat[$key]) || !is_array($arrayofvat[$key])) {
+							$arrayofvat[$key] = array();
+						}
+					}
+				}
+
+				foreach ($arrayofvat[$key] as $mt) {
+					if ($mt) {
+						$totaldebit += max($mt, 0);
+						$totalcredit += max(-$mt, 0);
+					}
+				}
+			}
+			// VAT-NPR counterpart - debit-positive
+			if (isset($data['tabother'][$key]) && is_array($data['tabother'][$key])) {
+				foreach ($data['tabother'][$key] as $mt) {
+					if ($mt) {
+						$totaldebit += max($mt, 0);
+						$totalcredit += max(-$mt, 0);
+					}
+				}
+			}
+
+			$result[$key] = array(
+				'total_ht' => (float) price2num($totalht, 'MT'),
+				'total_ttc' => (float) price2num($totalttc, 'MT'),
+				'total_debit' => (float) price2num($totaldebit, 'MT'),
+				'total_credit' => (float) price2num($totalcredit, 'MT'),
+			);
+		}
+		return $result;
 	}
 
 	/**

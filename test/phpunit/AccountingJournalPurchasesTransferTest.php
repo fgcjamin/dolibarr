@@ -214,6 +214,169 @@ class AccountingJournalPurchasesTransferTest extends CommonClassTest
 	}
 
 	/**
+	 * Phase 9: AccountingJournal::getPreviewAmountsForPurchases() must, computed BEFORE any
+	 * write, match what writeIntoBookkeepingForPurchases() actually posts to the ledger
+	 * afterward - the whole point of a "preview" is that it's trustworthy.
+	 *
+	 * @return void
+	 */
+	public function testGetPreviewAmountsForPurchasesMatchesWrite()
+	{
+		global $conf,$user,$langs,$db;
+		$conf = $this->savconf;
+		$user = $this->savuser;
+		$langs = $this->savlangs;
+		$db = $this->savdb;
+
+		$year = 2961;
+
+		$period = new Fiscalyear($db);
+		$period->label = 'AccountingJournalPurchasesTransferTest preview period '.$year;
+		$period->date_start = dol_mktime(0, 0, 0, 1, 1, $year);
+		$period->date_end = dol_mktime(23, 59, 59, 12, 31, $year);
+		$period_id = $period->create($user);
+		$this->assertGreaterThan(0, $period_id, $period->errorsToString());
+		unset($conf->cache['active_fiscal_period_cached']);
+
+		$sql = "SELECT rowid, pcg_version FROM ".MAIN_DB_PREFIX."accounting_system WHERE pcg_version = 'PCG25-DEV'";
+		$res = $db->query($sql);
+		$chart = $db->fetch_object($res);
+		$conf->global->CHARTOFACCOUNTS = (int) $chart->rowid;
+		$conf->global->ACCOUNTING_ACCOUNT_SUPPLIER = '401999';
+		$conf->global->ACCOUNTING_VAT_BUY_ACCOUNT = '445799';
+		$conf->global->ACCOUNTING_PRODUCT_BUY_ACCOUNT = '607999';
+
+		$this->seedAccount($db, $chart->pcg_version, '401999', 'AccountingJournalPurchasesTransferTest supplier control');
+		$acctProductId = $this->seedAccount($db, $chart->pcg_version, '607999', 'AccountingJournalPurchasesTransferTest product purchases');
+		$this->seedAccount($db, $chart->pcg_version, '445799', 'AccountingJournalPurchasesTransferTest VAT');
+
+		$dateLine = dol_mktime(12, 0, 0, 6, 15, $year);
+
+		$soc = new Societe($db);
+		$soc->name = 'AccountingJournalPurchasesTransferTest preview supplier';
+		$soc->fournisseur = 1;
+		$soc->code_fournisseur = -1;
+		$socId = $soc->create($user);
+		$this->assertGreaterThan(0, $socId, (string) $soc->error);
+
+		$fac = new FactureFournisseur($db);
+		$fac->socid = $socId;
+		$fac->date = $dateLine;
+		$fac->type = FactureFournisseur::TYPE_STANDARD;
+		$facId = $fac->create($user);
+		$this->assertGreaterThan(0, $facId, (string) $fac->error);
+
+		$lineId = $fac->addline('AccountingJournalPurchasesTransferTest preview line', 100, 20, 0, 0, 1, 0, 0, 0, 0, $acctProductId);
+		$this->assertGreaterThan(0, $lineId, (string) $fac->error);
+
+		$valResult = $fac->validate($user);
+		$this->assertGreaterThanOrEqual(0, $valResult, (string) $fac->error);
+
+		$journal = new AccountingJournal($db);
+		$sql = "SELECT rowid FROM ".MAIN_DB_PREFIX."accounting_journal WHERE nature = 3 AND entity = ".((int) $conf->entity);
+		$res = $db->query($sql);
+		$obj = $db->fetch_object($res);
+		$journal->fetch((int) $obj->rowid);
+
+		$date_start = dol_mktime(0, 0, 0, 1, 1, $year);
+		$date_end = dol_mktime(23, 59, 59, 12, 31, $year);
+
+		// Capture the preview BEFORE writing anything.
+		$data = $journal->getDataForPurchases($user, $date_start, $date_end, 'notyet');
+		$preview = $journal->getPreviewAmountsForPurchases($data);
+		$this->assertArrayHasKey($facId, $preview);
+		$this->assertEqualsWithDelta(100.0, $preview[$facId]['total_ht'], 0.01);
+		$this->assertEqualsWithDelta(120.0, $preview[$facId]['total_ttc'], 0.01);
+		$this->assertEqualsWithDelta(120.0, $preview[$facId]['total_debit'], 0.01);
+		$this->assertEqualsWithDelta(120.0, $preview[$facId]['total_credit'], 0.01);
+
+		$result = $journal->writeIntoBookkeepingForPurchases($user, $date_start, $date_end);
+		$this->assertGreaterThan(0, $result, implode(',', $journal->errors));
+
+		$sql = "SELECT SUM(debit) as d, SUM(credit) as c FROM ".MAIN_DB_PREFIX."accounting_bookkeeping";
+		$sql .= " WHERE doc_type = 'supplier_invoice' AND fk_doc = ".((int) $facId);
+		$res = $db->query($sql);
+		$obj = $db->fetch_object($res);
+		$this->assertEqualsWithDelta($preview[$facId]['total_debit'], (float) $obj->d, 0.01, 'Preview total_debit must match what was actually written');
+		$this->assertEqualsWithDelta($preview[$facId]['total_credit'], (float) $obj->c, 0.01, 'Preview total_credit must match what was actually written');
+	}
+
+	/**
+	 * Phase 9: getPreviewAmountsForPurchases() must correctly replicate
+	 * writeIntoBookkeepingForPurchases()'s VAT reverse-charge substitution (tabtva all-zero for
+	 * an invoice -> swap in tabrctva) - a synthetic hand-built $data array, no DB fixture at all,
+	 * since this method is a pure function over its input array and the baseline fixture above
+	 * has reverse-charge switched off (same simplification the original purchases write-method
+	 * slice used to keep its own baseline fixture's math simple).
+	 *
+	 * @return void
+	 */
+	public function testGetPreviewAmountsForPurchasesVatReverseCharge()
+	{
+		global $conf;
+		$conf = $this->savconf;
+		$conf->global->ACCOUNTING_FORCE_ENABLE_VAT_REVERSE_CHARGE = 1;
+
+		$journal = new AccountingJournal($this->savdb);
+		$data = array(
+			'tabfac' => array(1 => array('ref' => 'RC-TEST')),
+			'tabht' => array(1 => array('607999' => 0.0)),
+			'tabttc' => array(1 => array('401999' => 0.0)),
+			'tabtva' => array(1 => array('445799' => 0.0)), // all-zero: triggers the reverse-charge swap
+			'tablocaltax1' => array(1 => array()),
+			'tablocaltax2' => array(1 => array()),
+			'tabrctva' => array(1 => array('445798' => -15.0)),
+			'tabrclocaltax1' => array(1 => array()),
+			'tabrclocaltax2' => array(1 => array()),
+			'tabother' => array(),
+		);
+
+		$preview = $journal->getPreviewAmountsForPurchases($data);
+		$this->assertArrayHasKey(1, $preview);
+		// -15.0 is debit-positive per the write loop's VAT block rule: debit = max($mt,0)=0,
+		// credit = max(-$mt,0)=15.0.
+		$this->assertEqualsWithDelta(15.0, $preview[1]['total_credit'], 0.01);
+		$this->assertEqualsWithDelta(0.0, $preview[1]['total_debit'], 0.01);
+		// The all-zero tabtva entry must not be double-counted alongside the reverse-charge swap.
+		$this->assertEqualsWithDelta(0.0, $preview[1]['total_ht'], 0.01);
+		$this->assertEqualsWithDelta(0.0, $preview[1]['total_ttc'], 0.01);
+
+		unset($conf->global->ACCOUNTING_FORCE_ENABLE_VAT_REVERSE_CHARGE);
+	}
+
+	/**
+	 * Phase 9: getPreviewAmountsForPurchases() must fold the VAT-NPR counterpart bucket
+	 * (tabother) into total_debit/total_credit, but not into total_ht/total_ttc - synthetic
+	 * hand-built $data, same rationale as the reverse-charge test above.
+	 *
+	 * @return void
+	 */
+	public function testGetPreviewAmountsForPurchasesVatNpr()
+	{
+		$journal = new AccountingJournal($this->savdb);
+		$data = array(
+			'tabfac' => array(1 => array('ref' => 'NPR-TEST')),
+			'tabht' => array(1 => array('607999' => 0.0)),
+			'tabttc' => array(1 => array('401999' => 0.0)),
+			'tabtva' => array(1 => array('445799' => 0.0)),
+			'tablocaltax1' => array(1 => array()),
+			'tablocaltax2' => array(1 => array()),
+			'tabrctva' => array(),
+			'tabrclocaltax1' => array(),
+			'tabrclocaltax2' => array(),
+			'tabother' => array(1 => array('4458' => 5.0)),
+		);
+
+		$preview = $journal->getPreviewAmountsForPurchases($data);
+		$this->assertArrayHasKey(1, $preview);
+		// tabother is debit-positive: debit = max(5.0,0)=5.0, credit = max(-5.0,0)=0.
+		$this->assertEqualsWithDelta(5.0, $preview[1]['total_debit'], 0.01);
+		$this->assertEqualsWithDelta(0.0, $preview[1]['total_credit'], 0.01);
+		$this->assertEqualsWithDelta(0.0, $preview[1]['total_ht'], 0.01);
+		$this->assertEqualsWithDelta(0.0, $preview[1]['total_ttc'], 0.01);
+	}
+
+	/**
 	 * A "replaced" invoice (close_code == FactureFournisseur::CLOSECODE_REPLACED, not yet
 	 * dispatched) must be silently skipped by writeIntoBookkeepingForPurchases() - no
 	 * bookkeeping rows, no error counted.

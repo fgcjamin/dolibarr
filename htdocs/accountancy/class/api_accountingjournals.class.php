@@ -18,6 +18,8 @@
 use Luracast\Restler\RestException;
 
 require_once DOL_DOCUMENT_ROOT.'/accountancy/class/accountingjournal.class.php';
+require_once DOL_DOCUMENT_ROOT.'/compta/facture/class/facture.class.php';
+require_once DOL_DOCUMENT_ROOT.'/fourn/class/fournisseur.facture.class.php';
 
 /**
  * API class for accounting journals
@@ -353,17 +355,28 @@ class AccountingJournals extends DolibarrApi
 	/**
 	 * Preview pending (not-yet-journalized) accounting movements for a journal, without writing.
 	 *
-	 * Kept deliberately simple: a list of pending documents and whether each already carries an
-	 * error flag, not a full trial-balance preview (computing debit/credit subtotals without
-	 * writing would mean re-deriving the write loop's math a second time). Supports natures 1,
-	 * 2, 3, 4 (bank or treasury, depending on ACCOUNTING_MODE - see transfer()) and 5.
+	 * For natures 2 (sells) and 3 (purchases), each item additionally carries `total_ht`/
+	 * `total_ttc`/`total_debit`/`total_credit` subtotals, computed by
+	 * AccountingJournal::getPreviewAmountsForSells()/getPreviewAmountsForPurchases() from the
+	 * same tab-arrays getDataForSells()/getDataForPurchases() already collect - no DB writes are
+	 * performed. These 4 fields are forced to 0.0 (instead of the real preview value) for an
+	 * invoice that `has_error`, and for a replaced-but-not-yet-dispatched invoice (close_code ==
+	 * CLOSECODE_REPLACED) - the write loop skips the latter entirely (zero bookkeeping rows), and
+	 * that case isn't otherwise flagged by has_error, so leaving it unguarded would show a
+	 * plausible non-zero subtotal for a transfer that actually produces nothing.
+	 *
+	 * Natures 1, 4 (bank/treasury - see transfer() for the ACCOUNTING_MODE dispatch) and 5
+	 * (expense reports) still return `null` for these 4 fields: nature 1/4 have no comparable
+	 * per-line tab-array structure to aggregate cheaply, and nature 5 is left as a documented
+	 * follow-up (see roadmap/backlog.md Phase 9). The `null` convention (rather than omitting the
+	 * keys) keeps `items` one uniform shape across all natures.
 	 *
 	 * @param	int		$id				Accounting journal ID
 	 * @param	int		$date_start		Start date (timestamp)
 	 * @param	int		$date_end		End date (timestamp)
 	 * @return	array
-	 * @phan-return array{nb_elements:int,items:array<array{ref:string,has_error:bool}>}
-	 * @phpstan-return array{nb_elements:int,items:array<array{ref:string,has_error:bool}>}
+	 * @phan-return array{nb_elements:int,items:array<array{ref:string,has_error:bool,total_ht:?float,total_ttc:?float,total_debit:?float,total_credit:?float}>}
+	 * @phpstan-return array{nb_elements:int,items:array<array{ref:string,has_error:bool,total_ht:?float,total_ttc:?float,total_debit:?float,total_credit:?float}>}
 	 *
 	 * @url		GET journals/{id}/pendingdata
 	 *
@@ -391,17 +404,46 @@ class AccountingJournals extends DolibarrApi
 		if ((int) $journal->nature === 1) {
 			$journal_data = $journal->getData(DolibarrApiAccess::$user, 'bookkeeping', (int) $date_start, (int) $date_end, 'notyet');
 			foreach ($journal_data as $element) {
-				$items[] = array('ref' => (string) (!empty($element['ref']) ? $element['ref'] : ''), 'has_error' => !empty($element['error']));
+				$items[] = array(
+					'ref' => (string) (!empty($element['ref']) ? $element['ref'] : ''),
+					'has_error' => !empty($element['error']),
+					'total_ht' => null,
+					'total_ttc' => null,
+					'total_debit' => null,
+					'total_credit' => null,
+				);
 			}
 		} elseif ((int) $journal->nature === 2) {
 			$data = $journal->getDataForSells(DolibarrApiAccess::$user, (int) $date_start, (int) $date_end, 'notyet');
+			$preview = $journal->getPreviewAmountsForSells($data);
 			foreach ($data['tabfac'] as $key => $val) {
-				$items[] = array('ref' => (string) $val['ref'], 'has_error' => !empty($data['errorforinvoice'][$key]));
+				$has_error = !empty($data['errorforinvoice'][$key]);
+				$is_replaced_not_dispatched = ($val['close_code'] === Facture::CLOSECODE_REPLACED);
+				$show_amounts = !$has_error && !$is_replaced_not_dispatched;
+				$items[] = array(
+					'ref' => (string) $val['ref'],
+					'has_error' => $has_error,
+					'total_ht' => $show_amounts ? $preview[$key]['total_ht'] : 0.0,
+					'total_ttc' => $show_amounts ? $preview[$key]['total_ttc'] : 0.0,
+					'total_debit' => $show_amounts ? $preview[$key]['total_debit'] : 0.0,
+					'total_credit' => $show_amounts ? $preview[$key]['total_credit'] : 0.0,
+				);
 			}
 		} elseif ((int) $journal->nature === 3) {
 			$data = $journal->getDataForPurchases(DolibarrApiAccess::$user, (int) $date_start, (int) $date_end, 'notyet');
+			$preview = $journal->getPreviewAmountsForPurchases($data);
 			foreach ($data['tabfac'] as $key => $val) {
-				$items[] = array('ref' => (string) $val['ref'], 'has_error' => !empty($data['errorforinvoice'][$key]));
+				$has_error = !empty($data['errorforinvoice'][$key]);
+				$is_replaced_not_dispatched = ($val['close_code'] === FactureFournisseur::CLOSECODE_REPLACED);
+				$show_amounts = !$has_error && !$is_replaced_not_dispatched;
+				$items[] = array(
+					'ref' => (string) $val['ref'],
+					'has_error' => $has_error,
+					'total_ht' => $show_amounts ? $preview[$key]['total_ht'] : 0.0,
+					'total_ttc' => $show_amounts ? $preview[$key]['total_ttc'] : 0.0,
+					'total_debit' => $show_amounts ? $preview[$key]['total_debit'] : 0.0,
+					'total_credit' => $show_amounts ? $preview[$key]['total_credit'] : 0.0,
+				);
 			}
 		} elseif ((int) $journal->nature === 4) {
 			// See transfer() for why nature 4 needs the ACCOUNTING_MODE check.
@@ -415,12 +457,26 @@ class AccountingJournals extends DolibarrApi
 				// error map like tabfac/errorforinvoice does for sells/purchases, so has_error
 				// is always false here - consistent with this endpoint's own "not a full
 				// trial-balance preview" scope.
-				$items[] = array('ref' => (string) (!empty($val['ref']) ? $val['ref'] : ''), 'has_error' => false);
+				$items[] = array(
+					'ref' => (string) (!empty($val['ref']) ? $val['ref'] : ''),
+					'has_error' => false,
+					'total_ht' => null,
+					'total_ttc' => null,
+					'total_debit' => null,
+					'total_credit' => null,
+				);
 			}
 		} elseif ((int) $journal->nature === 5) {
 			$data = $journal->getDataForExpenseReports(DolibarrApiAccess::$user, (int) $date_start, (int) $date_end, 'notyet');
 			foreach ($data['taber'] as $key => $val) {
-				$items[] = array('ref' => (string) $val['ref'], 'has_error' => !empty($data['errorforinvoice'][$key]));
+				$items[] = array(
+					'ref' => (string) $val['ref'],
+					'has_error' => !empty($data['errorforinvoice'][$key]),
+					'total_ht' => null,
+					'total_ttc' => null,
+					'total_debit' => null,
+					'total_credit' => null,
+				);
 			}
 		} else {
 			throw new RestException(400, 'Preview via API is not yet implemented for this journal type (nature '.$journal->nature.'); see roadmap/backlog.md Phase 3b');
