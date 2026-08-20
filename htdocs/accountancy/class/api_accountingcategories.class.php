@@ -394,3 +394,8 @@ class AccountingAccountCategories extends DolibarrApi
 		}
 	}
 }
+
+// Dolibarr's API dispatcher (htdocs/api/index.php) resolves the class to load via
+// ucwords($moduleobject), i.e. "Accountingcategories" for URL prefix "accountingcategories" —
+// which doesn't match this class's real name. Alias it so class_exists() finds it.
+class_alias('AccountingAccountCategories', 'Accountingcategories');
