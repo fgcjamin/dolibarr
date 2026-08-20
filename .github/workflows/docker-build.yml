@@ -1,0 +1,76 @@
+name: "CI-DOCKER-BUILD"
+
+on:
+  push:
+    branches: [dev, develop]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Extract Dolibarr base version
+        id: ver
+        run: |
+          MAJOR=$(grep -oP "define\('DOL_MAJOR_VERSION', ?'\K[^']+" htdocs/version.inc.php)
+          MINOR=$(grep -oP "define\('DOL_MINOR_VERSION', ?'\K[^']+" htdocs/version.inc.php)
+          BASE="$MAJOR.$MINOR"
+          echo "Base Dolibarr version: $BASE"
+          echo "base=$BASE" >> "$GITHUB_OUTPUT"
+
+      # Fails the build if this fork's htdocs diff has grown outside the paths the Dockerfile
+      # COPYs — a signal that docker/Dockerfile needs updating (see docker/README.md).
+      - name: Guard against untracked htdocs drift
+        run: |
+          BASE_TAG="${{ steps.ver.outputs.base }}"
+          if ! git rev-parse "$BASE_TAG" >/dev/null 2>&1; then
+            echo "::warning::git tag $BASE_TAG not found, skipping htdocs drift guard"
+            exit 0
+          fi
+          ALLOWED='^htdocs/accountancy/|^htdocs/api/class/api_setup\.class\.php$|^htdocs/core/class/fiscalyear\.class\.php$|^htdocs/core/lib/functions2\.lib\.php$'
+          DRIFT=$(git diff --name-only "$BASE_TAG" HEAD -- htdocs | grep -vE "$ALLOWED" || true)
+          if [ -n "$DRIFT" ]; then
+            echo "::error::htdocs files changed outside docker/Dockerfile's COPY list:"
+            echo "$DRIFT"
+            exit 1
+          fi
+
+      - name: Compute image tags
+        id: tags
+        run: |
+          TAGS="ghcr.io/fgcjamin/dolibarr:${{ steps.ver.outputs.base }}-custom.${{ github.run_number }}
+          ghcr.io/fgcjamin/dolibarr:${{ github.ref_name }}"
+          if [ "${{ github.ref_name }}" = "develop" ]; then
+            TAGS="$TAGS
+          ghcr.io/fgcjamin/dolibarr:latest"
+          fi
+          {
+            echo "list<<TAGEOF"
+            echo "$TAGS"
+            echo "TAGEOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          build-args: DOLIBARR_BASE_VERSION=${{ steps.ver.outputs.base }}
+          push: true
+          tags: ${{ steps.tags.outputs.list }}
