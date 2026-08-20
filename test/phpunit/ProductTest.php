@@ -191,4 +191,101 @@ class ProductTest extends CommonClassTest
 
 		return $result;
 	}
+
+	/**
+	 * testProductAccountancyCodePerEntityShared
+	 *
+	 * Product::create()/update()/fetch() must route the 6 accountancy_code_* fields to
+	 * llx_product_perentity (scoped by fk_product+entity), not llx_product, whenever
+	 * MAIN_PRODUCT_PERENTITY_SHARED is on, and back to llx_product when it's off (default).
+	 * Deliberately not chained onto the create/fetch/update/delete tests above via a
+	 * dependency annotation: self-contained so it doesn't interfere with the shared fixture
+	 * id those tests pass along.
+	 *
+	 * @return  void
+	 */
+	public function testProductAccountancyCodePerEntityShared()
+	{
+		global $conf,$user,$langs,$db;
+		$conf = $this->savconf;
+		$user = $this->savuser;
+		$langs = $this->savlangs;
+		$db = $this->savdb;
+
+		$savPerentityShared = getDolGlobalString('MAIN_PRODUCT_PERENTITY_SHARED');
+
+		try {
+			// --- MAIN_PRODUCT_PERENTITY_SHARED on: accountancy codes must land in product_perentity ---
+			$conf->global->MAIN_PRODUCT_PERENTITY_SHARED = '1';
+
+			$localobject = new Product($db);
+			$localobject->ref = 'PHPUNIT-PERENTITY-'.time();
+			$localobject->label = 'PHPUnit per-entity-shared accountancy code test';
+			$localobject->type = Product::TYPE_PRODUCT;
+			$localobject->accountancy_code_buy = 'BUY1';
+			$localobject->accountancy_code_sell = 'SELL1';
+			$result = $localobject->create($user);
+			print __METHOD__." create result=".$result."\n";
+			$this->assertGreaterThan(0, $result, 'Error '.$localobject->error);
+			$id = $localobject->id;
+
+			$sql = "SELECT accountancy_code_buy, accountancy_code_sell FROM ".MAIN_DB_PREFIX."product WHERE rowid = ".((int) $id);
+			$resql = $db->query($sql);
+			$obj = $db->fetch_object($resql);
+			$this->assertSame('', (string) $obj->accountancy_code_buy, 'llx_product.accountancy_code_buy must stay empty when MAIN_PRODUCT_PERENTITY_SHARED is on');
+
+			$sql = "SELECT accountancy_code_buy, accountancy_code_sell FROM ".MAIN_DB_PREFIX."product_perentity WHERE fk_product = ".((int) $id)." AND entity = ".((int) $conf->entity);
+			$resql = $db->query($sql);
+			$this->assertEquals(1, $db->num_rows($resql), 'Expected exactly one product_perentity row for this product+entity');
+			$obj = $db->fetch_object($resql);
+			$this->assertSame('BUY1', $obj->accountancy_code_buy);
+			$this->assertSame('SELL1', $obj->accountancy_code_sell);
+
+			$fetched = new Product($db);
+			$fetched->fetch($id);
+			$this->assertSame('BUY1', $fetched->accountancy_code_buy, 'fetch() must read accountancy codes back from product_perentity');
+			$this->assertSame('SELL1', $fetched->accountancy_code_sell);
+
+			// update() must upsert (not duplicate) the product_perentity row
+			$fetched->accountancy_code_buy = 'BUY2';
+			$fetched->accountancy_code_sell = 'SELL2';
+			$result = $fetched->update($id, $user);
+			print __METHOD__." update result=".$result."\n";
+			$this->assertGreaterThan(0, $result, 'Error '.$fetched->error);
+
+			$sql = "SELECT COUNT(*) as nb FROM ".MAIN_DB_PREFIX."product_perentity WHERE fk_product = ".((int) $id)." AND entity = ".((int) $conf->entity);
+			$resql = $db->query($sql);
+			$obj = $db->fetch_object($resql);
+			$this->assertEquals(1, $obj->nb, 'update() must upsert the existing product_perentity row, not insert a second one');
+
+			$refetched = new Product($db);
+			$refetched->fetch($id);
+			$this->assertSame('BUY2', $refetched->accountancy_code_buy);
+			$this->assertSame('SELL2', $refetched->accountancy_code_sell);
+
+			// --- MAIN_PRODUCT_PERENTITY_SHARED off (default): regression check, base table still used ---
+			$conf->global->MAIN_PRODUCT_PERENTITY_SHARED = '0';
+
+			$defobject = new Product($db);
+			$defobject->ref = 'PHPUNIT-DEFAULT-'.time();
+			$defobject->label = 'PHPUnit default-mode accountancy code test';
+			$defobject->type = Product::TYPE_PRODUCT;
+			$defobject->accountancy_code_buy = 'DBUY1';
+			$result = $defobject->create($user);
+			print __METHOD__." create (default mode) result=".$result."\n";
+			$this->assertGreaterThan(0, $result, 'Error '.$defobject->error);
+
+			$sql = "SELECT accountancy_code_buy FROM ".MAIN_DB_PREFIX."product WHERE rowid = ".((int) $defobject->id);
+			$resql = $db->query($sql);
+			$obj = $db->fetch_object($resql);
+			$this->assertSame('DBUY1', $obj->accountancy_code_buy, 'llx_product.accountancy_code_buy must be used when MAIN_PRODUCT_PERENTITY_SHARED is off');
+
+			$sql = "SELECT COUNT(*) as nb FROM ".MAIN_DB_PREFIX."product_perentity WHERE fk_product = ".((int) $defobject->id);
+			$resql = $db->query($sql);
+			$obj = $db->fetch_object($resql);
+			$this->assertEquals(0, $obj->nb, 'No product_perentity row should be created when MAIN_PRODUCT_PERENTITY_SHARED is off');
+		} finally {
+			$conf->global->MAIN_PRODUCT_PERENTITY_SHARED = $savPerentityShared;
+		}
+	}
 }

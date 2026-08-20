@@ -23,7 +23,7 @@ Workflow steps referenced below are the ones from the module's own usage guide:
 | 2 | Create a chart-of-accounts model | **Closed** — see Phase 6 in `roadmap/backlog.md` |
 | 3 (the "select" half) | Activate a chart-of-accounts model | **Missing** — UI-only, and non-trivial to replicate |
 | 6 | Link a bank account to its accounting journal | Not missing — already possible via the generic Products/Bank API, just not wired into this MCP server yet |
-| 9 | Set product/service accounting codes | Not missing in the default config — same as above; one edge case is missing (see below) |
+| 9 | Set product/service accounting codes | Not missing, in either config — see Phase 10 in `roadmap/backlog.md` |
 | *(not in the 9+5 list)* | Manage accounting account categories | **Closed** — see Phase 8 in `roadmap/backlog.md` |
 | *(not in the 9+5 list)* | CSV import of a chart of accounts | **Missing** — no API wrapper at all |
 | C | Preview exact debit/credit amounts before ledger transfer | **Partial** — preview exists but only returns ref + error flag, not amounts (a deliberate design tradeoff, not an oversight) |
@@ -82,20 +82,29 @@ PUT /bankaccounts/{id}
 **Nothing to add on the Dolibarr side.** This MCP server just doesn't currently wrap the generic
 `bankaccounts` endpoint — see "MCP server follow-up" below.
 
-### 4. Product/service accounting codes (Step 9) — not actually missing (default config)
+### 4. Product/service accounting codes (Step 9) — not missing, in either config (see Phase 10, `roadmap/backlog.md`)
 
 Same situation as bank accounts: `htdocs/product/class/api_products.class.php`'s `$FIELDS` is only
 `ref, label` for validation purposes, but `post()`/`put()` forward arbitrary fields onto the `Product`
 object. `Product` has public `accountancy_code_sell`, `accountancy_code_sell_intra`,
 `accountancy_code_sell_export`, `accountancy_code_buy`, `accountancy_code_buy_intra`,
-`accountancy_code_buy_export` (`product.class.php:579-599`), and `Product::update()` persists them —
-**provided** the `MAIN_PRODUCT_PERENTITY_SHARED` global is off (the default).
+`accountancy_code_buy_export` (`product.class.php:579-599`), and `Product::update()`/`create()`
+persist them correctly **in both configs**, not just when `MAIN_PRODUCT_PERENTITY_SHARED` is off.
 
-**One real edge case remains:** if `MAIN_PRODUCT_PERENTITY_SHARED` is enabled, `Product::update()`
-deliberately skips these fields (`product.class.php:1621-1628`), and the only way to set them is
-`Product::setAccountancyCode($type, $value)` (`product.class.php:2148-2176`), which no `api_products`
-endpoint calls. This would need a narrow new endpoint, e.g. `PUT products/{id}/accountancycodes`, only
-if that entity-sharing mode is in use.
+**Corrected from an earlier assumption** (this item originally claimed `Product::update()`
+"deliberately skips" these fields when `MAIN_PRODUCT_PERENTITY_SHARED` is on, and that a new
+endpoint wrapping `Product::setAccountancyCode()` would be needed to close the gap): `update()`
+does skip them from the `UPDATE llx_product` SET-clause in that mode (`product.class.php:1621-1628`)
+— but immediately after (lines 1660-1688), a second block guarded by the same flag deletes+inserts
+all 6 fields into `llx_product_perentity`, scoped to `(fk_product, conf->entity)`; `create()` has
+the identical pair of blocks. `fetch()` (lines 2955-2996) is symmetric, reading from
+`product_perentity` instead of `product` in that mode. So the standard `GET/PUT/POST products/{id}`
+endpoints already work correctly in both modes, with no code changes needed — confirmed via a live
+test against a real DB in both configs, see Phase 10 in `roadmap/backlog.md` for the full writeup
+and the regression test added to `test/phpunit/ProductTest.php`.
+`Product::setAccountancyCode($type, $value)` (`product.class.php:2149-2210`) — the method this item
+originally proposed wrapping — is confirmed unused (no callers anywhere in `htdocs/`) and is *not*
+per-entity-aware; wiring an endpoint to it would have been a regression, not a fix.
 
 ### 5. Accounting account categories — closed (see Phase 8, `roadmap/backlog.md`)
 
@@ -130,6 +139,7 @@ highest-risk part of the accountancy module.
 Items 3 and 4 above are already achievable through Dolibarr's generic `bankaccounts` and `products`
 APIs. The MCP server now wraps them as `accounting_bank_account_journal` (get/set
 `fk_accountancy_journal`) and `accounting_product_codes` (get/set the six `accountancy_code_*` fields),
-so steps 6 and 9 of the setup workflow are covered end-to-end without any further Dolibarr-side changes.
-Only the `MAIN_PRODUCT_PERENTITY_SHARED` edge case from item 4 remains unaddressed, since fixing it
-requires a new Dolibarr endpoint (wrapping `Product::setAccountancyCode()`), not just an MCP tool.
+so steps 6 and 9 of the setup workflow are covered end-to-end without any further Dolibarr-side changes
+— including under `MAIN_PRODUCT_PERENTITY_SHARED`, confirmed by Phase 10's research
+(`roadmap/backlog.md`) to already work correctly through the standard `products` endpoint, no new
+Dolibarr endpoint needed.

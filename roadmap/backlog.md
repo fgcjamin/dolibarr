@@ -7,8 +7,8 @@ Phases 1-5 are implemented and cover the 9-step setup workflow and the 5-step re
 install can be driven through the accountancy module end to end via the API alone, with no UI step
 required. Phases 6-11 are a follow-up backlog written after auditing what's still missing beyond
 that core workflow (see `roadmap/API_GAPS.md` for the source analysis) — Phases 6, 7, 8, 9, and 11
-are implemented; Phase 10 is scoped but open, blocked pending further research (see its section
-below).
+are implemented; Phase 10 (blocked pending research) turned out, once that research was done, not
+to be a real gap at all — see its section below.
 
 | Phase | Scope | Status | Key files |
 |---|---|---|---|
@@ -22,7 +22,7 @@ below).
 | 7 | Activate a chart of accounts (step 3, "select" half) | Done | `accountancysystem.class.php` (`activate()`), `api_accountingsetup.class.php` (`accountingsystems/{id}/activate[/preview]`) |
 | 8 | Accounting account categories CRUD + assignment | Done | `accountancycategory.class.php` (bug fix in `create()`), new `api_accountingcategories.class.php` |
 | 9 | Ledger-transfer preview amounts (step C enhancement) | Done | `accountingjournal.class.php` (`getPreviewAmountsForSells()`/`getPreviewAmountsForPurchases()`), `api_accountingjournals.class.php` (`pendingData()`) |
-| 10 | Product accountancy codes under `MAIN_PRODUCT_PERENTITY_SHARED` | Open — needs research first | `product.class.php`, `api_products.class.php` |
+| 10 | Product accountancy codes under `MAIN_PRODUCT_PERENTITY_SHARED` | Closed — not a real gap, see below | `product.class.php`, `api_products.class.php`, `test/phpunit/ProductTest.php` |
 | 11 | Chart-of-accounts CSV import | Done | new `api_accountingimport.class.php` |
 
 **One non-blocking follow-up, not a functional gap**: `test/phpunit/AccountingBindTest.php`
@@ -914,22 +914,62 @@ via the CI-matching `bootstrap_action.php` bootstrap) passes clean on both modif
 files; running it against the two modified test files surfaces only pre-existing PHPUnit-stub
 noise (confirmed identical on an untouched sibling test file), nothing specific to the new code.
 
-## Phase 10 — Remaining API_GAPS.md item — Open, scoped not implemented
+## Phase 10 — Product accountancy codes under `MAIN_PRODUCT_PERENTITY_SHARED` — Closed, not a real gap
 
-Deliberately left out of Phases 6, 7, 8, 9, and 11 for a concrete reason (risk, an unresolved
-signature mismatch, unconfirmed correctness, or no precedent to build on in this codebase) — see
-`roadmap/API_GAPS.md` for the original gap analysis this backlog is closing out.
-
-**Phase 10 — Product accountancy codes under `MAIN_PRODUCT_PERENTITY_SHARED`.** A narrow `PUT
+The original gap analysis (`roadmap/API_GAPS.md` item 4) proposed a narrow `PUT
 products/{id}/accountancycodes` wrapping `Product::setAccountancyCode($type, $value)`
-(`htdocs/product/class/product.class.php:2149-2210`) would bypass `update()`'s per-entity-mode
-skip of the 6 `accountancy_code_*` fields (`product.class.php:1621-1628`). **Do not implement
-until researched further**: `setAccountancyCode()` writes to the base `product` table's columns
-unconditionally, even when `MAIN_PRODUCT_PERENTITY_SHARED` is on — but that mode's whole premise
-is that these fields live in `product_perentity` instead. Confirm how the per-entity-aware read
-paths (product card, wherever these fields are resolved with entity precedence) actually consume
-the base-table column before wiring an API endpoint to it, or the endpoint will "close" this gap
-only nominally, not functionally.
+(`htdocs/product/class/product.class.php:2149-2210`) to bypass `update()`'s per-entity-mode skip
+of the 6 `accountancy_code_*` fields (`product.class.php:1621-1628`), but flagged it as too risky
+to build blind — the analysis noted `setAccountancyCode()` always writes straight to the base
+`product` table even when `MAIN_PRODUCT_PERENTITY_SHARED` is on, and asked for research into how
+the per-entity-aware read paths actually consume these fields before wiring anything up.
+
+**That research found the original analysis was itself incomplete, and closes this phase with no
+code changes needed.** `product.class.php:1621-1628` does skip the 6 fields from the `UPDATE
+llx_product` SET-clause when the flag is on — but immediately after (lines 1660-1688, still inside
+`update()`), a second block guarded by the same flag does a `DELETE FROM llx_product_perentity
+WHERE fk_product=... AND entity=...` followed by an `INSERT` of all 6 fields, scoped to
+`(fk_product, conf->entity)` — the earlier analysis read the skip but missed this second block
+right after it. `Product::create()` has the identical pair of blocks (lines 1134-1141/1169-1176
+skip, 1212-1239 perentity upsert). `Product::fetch()` (lines 2955-2996) is symmetric: it selects
+the 6 fields from `ppe.*` (`product_perentity`, left-joined on the current `conf->entity`) instead
+of `p.*` when the flag is on. So `Product::create()`/`update()`/`fetch()` are all already fully
+per-entity-aware for these 6 fields — this is the same abstraction boundary the product card UI
+(`htdocs/product/card.php`) relies on: it has zero `MAIN_PRODUCT_PERENTITY_SHARED`-aware code of
+its own, it just reads/writes `$object->accountancy_code_*` and calls `fetch()`/`create()`/
+`update()`.
+
+Since `htdocs/product/class/api_products.class.php`'s `put()`/`post()` already forward every
+request-body key onto `$this->product->$field` before calling `update()`/`create()` (`$FIELDS` —
+`ref`, `label` — is only used for mandatory-field validation on create, not as a write allowlist),
+and `_cleanObjectDatas()` doesn't strip `accountancy_code_*` from `get()` responses either, **the
+standard `GET/PUT/POST products/{id}` endpoints already correctly read and write these 6 fields in
+both modes today.** No new endpoint was needed, and building the originally-proposed one would
+actually have been a regression: `setAccountancyCode()` is confirmed unused (zero callers anywhere
+in `htdocs/`) and not per-entity-aware, so wiring an endpoint to it would have silently written to
+the wrong table under `MAIN_PRODUCT_PERENTITY_SHARED=1` (a value `fetch()` would never read back,
+and not scoped to the current entity). Per-session decision: leave `setAccountancyCode()` itself
+unfixed since it's genuinely dead code and out of this phase's scope — see
+[[project-accountancy-api-gotchas]] item 36 for the landmine note.
+
+**Verification done**: live-tested against the local test DB (see item 10 in
+[[project-accountancy-api-gotchas]] for the environment) — created and updated a product with
+`MAIN_PRODUCT_PERENTITY_SHARED` on, confirmed via direct SQL that `llx_product`'s accountancy
+columns stayed empty, `llx_product_perentity` got exactly one upserted row (not duplicated) keyed
+on `(fk_product, entity)`, and `fetch()` read the values back correctly; repeated with the flag off
+to confirm the default/base-table path is unaffected. Regression test added:
+`test/phpunit/ProductTest.php::testProductAccountancyCodePerEntityShared()` (self-contained, not
+part of the create/fetch/update/delete `@depends` chain in the rest of that file), covering both
+modes — passes (6 tests, 20 assertions in that file as of this phase).
+
+**Environment gotcha found during this phase**: the local test DB (item 10 in
+[[project-accountancy-api-gotchas]]) was missing both `llx_product_perentity` and
+`llx_societe_perentity` — the only two `*_perentity` tables in the codebase, both shipped as
+regular (non-module-gated) core tables under `htdocs/install/mysql/tables/*-multicompany.sql`
+despite the filename — and had the `product` module disabled. Both are now fixed permanently in
+the shared test DB (tables created from their shipped `.sql`/`.key.sql` files, `product` module
+enabled via `modProduct::init()`, same pattern as item 10's `fournisseur` fix) rather than
+worked around per-script — see [[project-accountancy-api-gotchas]] item 37.
 
 ## Phase 11 — Chart-of-accounts CSV import — Implemented
 
