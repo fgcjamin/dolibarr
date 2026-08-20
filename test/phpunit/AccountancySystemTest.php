@@ -108,4 +108,53 @@ class AccountancySystemTest extends CommonClassTest
 
 		return $accountancySystem;
 	}
+
+	/**
+	 * testAccountancySystemUpdate
+	 *
+	 * @param	AccountancySystem	$accountancySystem		Object from testAccountancySystemFetch
+	 * @return	AccountancySystem							Updated record object
+	 *
+	 * @depends	testAccountancySystemFetch
+	 * The depends says test is run only if previous is ok
+	 */
+	public function testAccountancySystemUpdate($accountancySystem)
+	{
+		global $db, $user;
+
+		$accountancySystem->label = 'PCG99-CUSTOMTEST-Updated';
+		$result = $accountancySystem->update($user);
+		print __METHOD__." id=".$accountancySystem->id." result=".$result."\n";
+		$this->assertLessThan($result, 0, 'Cannot update accountancySystem:'.$accountancySystem->error);
+
+		$check = new AccountancySystem($db);
+		$check->fetch($accountancySystem->id);
+		$this->assertEquals($check->label, 'PCG99-CUSTOMTEST-Updated');
+		$this->assertEquals($check->pcg_version, 'PCG99-CUSTOMTEST');
+
+		return $accountancySystem;
+	}
+
+	/**
+	 * testAccountancySystemDelete
+	 *
+	 * @param	AccountancySystem	$accountancySystem		Object from testAccountancySystemUpdate
+	 * @return	void
+	 *
+	 * @depends	testAccountancySystemUpdate
+	 * The depends says test is run only if previous is ok
+	 */
+	public function testAccountancySystemDelete($accountancySystem)
+	{
+		global $db, $user;
+
+		$id = $accountancySystem->id;
+		$result = $accountancySystem->delete($user);
+		print __METHOD__." id=".$id." result=".$result."\n";
+		$this->assertLessThan($result, 0, 'Cannot delete accountancySystem:'.$accountancySystem->error);
+
+		$check = new AccountancySystem($db);
+		$checkresult = $check->fetch($id);
+		$this->assertEquals(0, $checkresult);
+	}
 }

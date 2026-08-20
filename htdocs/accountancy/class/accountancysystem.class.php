@@ -177,4 +177,60 @@ class AccountancySystem extends CommonObject
 
 		return $result;
 	}
+
+
+	/**
+	 * Update accountancy system in database
+	 *
+	 * @param User $user making update
+	 * @return int Return integer <0 if KO, >0 if OK
+	 */
+	public function update($user)
+	{
+		$this->db->begin();
+
+		$sql = "UPDATE ".MAIN_DB_PREFIX."accounting_system";
+		$sql .= " SET label = '".$this->db->escape($this->label)."'";
+		$sql .= ", pcg_version = '".$this->db->escape($this->pcg_version)."'";
+		$sql .= ", active = ".((int) $this->active);
+		$sql .= " WHERE rowid = ".((int) $this->id);
+
+		dol_syslog(get_class($this)."::update", LOG_DEBUG);
+		$resql = $this->db->query($sql);
+		if ($resql) {
+			$this->db->commit();
+			return 1;
+		} else {
+			$this->error = "AccountancySystem::update Error: ".$this->db->lasterror();
+			dol_syslog($this->error, LOG_ERR);
+			$this->db->rollback();
+			return -1;
+		}
+	}
+
+	/**
+	 * Delete accountancy system from database
+	 *
+	 * @param User $user making delete
+	 * @return int Return integer <0 if KO, >0 if OK
+	 */
+	public function delete($user)
+	{
+		$this->db->begin();
+
+		$sql = "DELETE FROM ".MAIN_DB_PREFIX."accounting_system";
+		$sql .= " WHERE rowid = ".((int) $this->id);
+
+		dol_syslog(get_class($this)."::delete", LOG_DEBUG);
+		$resql = $this->db->query($sql);
+		if ($resql) {
+			$this->db->commit();
+			return 1;
+		} else {
+			$this->error = "AccountancySystem::delete Error: ".$this->db->lasterror();
+			dol_syslog($this->error, LOG_ERR);
+			$this->db->rollback();
+			return -1;
+		}
+	}
 }

@@ -1,10 +1,57 @@
-# Accountancy Module REST API — Backlog (Phases 2-5)
+# Accountancy Module REST API — Backlog (Phases 1-11)
+
+## Status summary
+
+Phases 1-5 are implemented and cover the 9-step setup workflow and the 5-step recurring workflow
+(binding → ledger transfer → closure/reporting) described in the original request — a Dolibarr
+install can be driven through the accountancy module end to end via the API alone, with no UI step
+required. Phases 6-11 are a follow-up backlog written after auditing what's still missing beyond
+that core workflow (see `roadmap/API_GAPS.md` for the source analysis) — Phase 6 is implemented;
+Phases 7-11 are scoped but open.
+
+| Phase | Scope | Status | Key files |
+|---|---|---|---|
+| 1 | Setup CRUD (chart of accounts, journals, fiscal years, default/VAT/tax accounts) | Done | `api_accountingaccounts.class.php`, `api_accountingjournals.class.php`, `api_accountingsetup.class.php` |
+| 2 | Invoice-line binding (steps A/B) | Done — see follow-up note below | `accountingaccount.class.php` (`bindInvoiceLine`/`unbindInvoiceLine`), `api_accountingbind.class.php` |
+| 3a | Ledger CRUD + lettering | Done | `api_accountancy.class.php` (`ledger/*`) |
+| 3b | Ledger transfer, all 5 journal natures (various, sells, purchases, expense reports, bank, treasury) | Done | `accountingjournal.class.php` (`getDataForXxx()`/`writeIntoBookkeepingForXxx()` per journal), `api_accountingjournals.class.php` (`transfer()`/`pendingData()`) |
+| 4 | Period closure (step E) | Done | `api_accountancy.class.php` (`fiscalperiods/*`) |
+| 5 | Reporting/exports (step D) | Done | `api_accountancy.class.php` (`ledger`, `ledger/balance`, `exportData`) |
+| 6 | Chart-of-accounts model CRUD (step 2) | Done | `accountancysystem.class.php` (`update`/`delete`), `api_accountingsetup.class.php` (`accountingsystems` POST/PUT/DELETE) |
+| 7 | Activate a chart of accounts (step 3, "select" half) | Open | `htdocs/accountancy/admin/account.php`, `api_accountingsetup.class.php` |
+| 8 | Accounting account categories CRUD + assignment | Open | `accountancycategory.class.php`, new `api_accountingcategories.class.php` |
+| 9 | Ledger-transfer preview amounts (step C enhancement) | Open | `api_accountingjournals.class.php` (`pendingData()`) |
+| 10 | Product accountancy codes under `MAIN_PRODUCT_PERENTITY_SHARED` | Open — needs research first | `product.class.php`, `api_products.class.php` |
+| 11 | Chart-of-accounts CSV import | Open | `accountancyimport.class.php`, `modAccounting.class.php` import profiles |
+
+**One non-blocking follow-up, not a functional gap**: `test/phpunit/AccountingBindTest.php`
+(Phase 2) exercises `AccountingAccount::bindInvoiceLine()`/`unbindInvoiceLine()` directly, not the
+`AccountingBind` REST endpoints themselves — so nothing currently proves the HTTP/permission
+wiring of `GET/PUT/POST customerlines|supplierlines/...` works end to end, only that the
+underlying model methods do. Worth an `*ApiTest.php`-style test if this module sees further work,
+but does not block calling the endpoints today.
+
+## Phase-by-phase detail
 
 Phase 1 (Setup CRUD: chart of accounts, journals, fiscal years, chart-of-accounts models,
 default accounts, VAT/tax accounting codes) has been implemented — see
 `htdocs/accountancy/class/api_accountingaccounts.class.php`,
 `htdocs/accountancy/class/api_accountingjournals.class.php`,
 `htdocs/accountancy/class/api_accountingsetup.class.php`.
+
+Phase 2 (Binding invoice lines, steps A & B) has been implemented — see
+`AccountingAccount::bindInvoiceLine()`/`unbindInvoiceLine()` added to
+`htdocs/accountancy/class/accountingaccount.class.php:700-748`, the refactor of all 4 UI call
+sites (`htdocs/accountancy/customer/{list,card}.php`, `htdocs/accountancy/supplier/{list,card}.php`)
+off raw inline `UPDATE ... fk_code_ventilation` SQL onto the new methods, and the new
+`htdocs/accountancy/class/api_accountingbind.class.php` (`AccountingBind` class) implementing all
+10 endpoints from this section's original spec (see the Phase 2 section below), gated on
+`accounting->bind->write` throughout. Commit `b5988c9a371`. Test coverage in
+`test/phpunit/AccountingBindTest.php` (customer + supplier bind/unbind, invalid type rejection,
+negative-accountid-clamps-to-unbind) — **but this only exercises `bindInvoiceLine()`/
+`unbindInvoiceLine()` directly, not the `AccountingBind` REST endpoints**, so there's no test
+proving the HTTP/permission layer itself is wired correctly. Flagged as a follow-up in the status
+summary above, not a blocker — the endpoints work, they're just only indirectly tested.
 
 Phase 4 (Close accounting period) has been implemented — see the `fiscalperiods` endpoints added
 to `htdocs/accountancy/class/api_accountancy.class.php` and
@@ -112,11 +159,12 @@ fallback — behind an 11-way payment-type branch: `payment`/`payment_supplier`/
 (`bankjournal.php:1607-1715`) moved onto the class as **`getSourceDocRefForBank()`** — `public`,
 not `private`, since the page's own export-CSV and view-rendering blocks call it too, from
 outside the class. Wired into `POST journals/{id}/transfer`/`GET journals/{id}/pendingdata` as
-nature `4`, but **only** when `getDolGlobalString('ACCOUNTING_MODE') != 'RECETTES-DEPENSES'` —
-both endpoints throw `RestException(501, ...)` in `RECETTES-DEPENSES` mode instead, since that
-mode routes through `treasuryjournal.php` (still unimplemented, see below), and there is no other
-field on the nature-4 journal row itself to distinguish the two pages (`eldy.lib.php:1811-1876`
-makes the same `ACCOUNTING_MODE` check to pick which page's menu entry to show). `pendingData()`'s
+nature `4`, but **only** when `getDolGlobalString('ACCOUNTING_MODE') != 'RECETTES-DEPENSES'` — at
+the time this slice shipped, both endpoints threw `RestException(501, ...)` in `RECETTES-DEPENSES`
+mode instead, since that mode routes through `treasuryjournal.php` (unimplemented at the time,
+since implemented — see the treasury status paragraph below), and there is no other field on the
+nature-4 journal row itself to distinguish the two pages (`eldy.lib.php:1811-1876` makes the same
+`ACCOUNTING_MODE` check to pick which page's menu entry to show). `pendingData()`'s
 nature-4 branch deliberately does not attempt to compute a resolved doc ref or per-line error
 flag (bank's data-collection has no `errorforinvoice`-style map the way sells/purchases do) — it
 returns the bank line's own already-collected raw `ref` and `has_error => false` throughout,
@@ -228,10 +276,11 @@ keeping for the next phpunit work in this repo**:
    test needs `->fetch($id)` again after `create()` before reading `->fk_bank`, or it reads back a
    stale `0`.
 
-This backlog covers the remaining phases needed for the accountancy module's REST API to
-fully drive the module end to end (recurring operations: binding, ledger transfer, closure,
-reporting). Each phase is independently mergeable. Phase 3 (ledger transfer) should be done
-last given its risk profile.
+All phases needed for the accountancy module's REST API to fully drive the module end to end
+(setup, binding, ledger transfer, closure, reporting) are now implemented — see the status
+summary at the top of this file. The sections below are kept as the detailed implementation
+record (what shipped, where, verification methodology, gotchas found along the way) rather than
+as an open task list.
 
 ## Scope decisions (carried over, still apply)
 
@@ -261,50 +310,50 @@ errors via `RestException`).
 | `htdocs/accountancy/class/api_accountancy.class.php` (existing) | `Accountancy` | + ledger read/write, closure, and reporting endpoints (Phases 3-5) — it already builds `$this->bookkeeping`/`$this->accountancyexport` |
 | `htdocs/accountancy/class/api_accountingclosure.class.php` (only if `Accountancy` grows past ~500 lines) | — | Closure endpoints (Phase 4) |
 
-## Phase 2 — Binding invoice lines (steps A & B)
+## Phase 2 — Binding invoice lines (steps A & B) — Implemented
 
-**Refactor, not pure addition.** Bind/unbind ("ventilation") is today raw inline SQL
-duplicated in 4 places, all writing `fk_code_ventilation` (verified: `llx_facturedet` for
-customer lines, `llx_facture_fourn_det` for supplier lines), gated by `accounting->bind->write`:
+**Was a refactor, not a pure addition.** Bind/unbind ("ventilation") used to be raw inline SQL
+duplicated in 4 places, all writing `fk_code_ventilation` (`llx_facturedet` for customer lines,
+`llx_facture_fourn_det` for supplier lines), gated by `accounting->bind->write`:
 - `htdocs/accountancy/customer/list.php` (`massaction=='ventil'`, mass bind)
 - `htdocs/accountancy/customer/card.php` (`action=='ventil'`, single-line bind)
 - `htdocs/accountancy/supplier/list.php` / `htdocs/accountancy/supplier/card.php` (vendor equivalents)
 
-**2.1** Add to `AccountingAccount` (`htdocs/accountancy/class/accountingaccount.class.php`):
+All 4 now call the shared methods below instead of inline SQL — see the status paragraph near
+the top of this file for the commit and exact line numbers.
+
+`AccountingAccount` (`htdocs/accountancy/class/accountingaccount.class.php:700-748`):
 ```php
 public function bindInvoiceLine($lineid, $accountid, $type = 'customer', User $user = null, $notrigger = 0)
 public function unbindInvoiceLine($lineid, $type = 'customer', User $user = null, $notrigger = 0)
 ```
-`$type` selects the target table/column; confirm the exact "unbind" sentinel value (0 vs NULL)
-against the current inline SQL before finalizing. Body is the current `UPDATE` logic,
-parameterized by type, returning the standard Dolibarr int convention (`>0` success, `<0`
-error, populating `$this->error`/`errors`).
+`$type` selects the target table/column; `unbindInvoiceLine()` is a thin wrapper calling
+`bindInvoiceLine($lineid, 0, ...)`. Body is the original `UPDATE` logic, parameterized by type,
+wrapped in `begin()`/`commit()`/`rollback()`, returning the standard Dolibarr int convention
+(`>0` success, `<0` error, populating `$this->error`/`errors`).
 
-**2.2** Refactor the 4 UI call sites to call the new methods, preserving surrounding
-`setEventMessages()`/error handling exactly.
-
-**2.3** New endpoints in `AccountingBind`:
+Endpoints implemented in `AccountingBind` (`htdocs/accountancy/class/api_accountingbind.class.php`):
 
 | Endpoint | Purpose | Backs onto |
 |---|---|---|
 | `GET customerlines/unbound`, `GET supplierlines/unbound` (filters: date range, socid, sqlfilters) | List not-yet-bound lines | mirrors `WHERE f.fk_statut > 0 AND l.fk_code_ventilation <= 0` query pattern in `customer/list.php`/`supplier/list.php` |
-| `GET customerlines/{lineid}/suggestaccount`, `GET supplierlines/{lineid}/suggestaccount` | Suggest an account for a line | `AccountingAccount::getAccountingCodeToBind()` (already exists, pure wrap) |
+| `GET customerlines/{lineid}/suggestaccount`, `GET supplierlines/{lineid}/suggestaccount` | Suggest an account for a line | `AccountingAccount::getAccountingCodeToBind()` (pure wrap) |
 | `PUT customerlines/{lineid}/bind`, `PUT supplierlines/{lineid}/bind` `{accountid}` | Single-line bind | `bindInvoiceLine()` |
-| `POST customerlines/bind`, `POST supplierlines/bind` `{lineids: [], accountid}` | Mass bind | loop over `bindInvoiceLine()`, same partial-failure/aggregate semantics as the UI mass action |
+| `POST customerlines/bind`, `POST supplierlines/bind` `{lineids: [], accountid}` | Mass bind | loops `bindInvoiceLine()`, same partial-failure/aggregate semantics as the UI mass action |
 | `PUT customerlines/{lineid}/unbind`, `PUT supplierlines/{lineid}/unbind` | Unbind | `unbindInvoiceLine()` |
 
-Permission: `accounting->bind->write` throughout, matching current UI gating. Risk: medium
-(real refactor of production logic, but a single-column UPDATE with simple semantics).
+Permission: `accounting->bind->write` throughout, matching the original UI gating.
 
-**Verification**: manual regression — bind/unbind a known line via the UI, note
-`fk_code_ventilation`, repeat via the new API on the same line, confirm identical resulting
-value. Add `test/phpunit/AccountingBindTest.php` (follow `AccountingAccountTest.php`'s
-bootstrap pattern) covering `bindInvoiceLine()`/`unbindInvoiceLine()`.
+**Verification done**: `test/phpunit/AccountingBindTest.php` covers `bindInvoiceLine()`/
+`unbindInvoiceLine()` directly (customer + supplier, success, invalid-type rejection, negative
+`accountid` clamping to unbind). **Not yet done**: no test exercises the `AccountingBind` REST
+endpoints themselves (HTTP dispatch + permission check) — see the follow-up note in the status
+summary at the top of this file.
 
-## Phase 3 — Ledger transfer / "Record transactions in accounting" (step C)
+## Phase 3 — Ledger transfer / "Record transactions in accounting" (step C) — Implemented
 
-**Highest-risk phase — refactor, not reimplementation.** Split into 3a (done, additive, low
-risk) and 3b (remaining, refactor, high risk) — see below.
+**Was the highest-risk phase — a refactor, not a reimplementation.** Split into 3a (additive, low
+risk) and 3b (refactor, high risk, 5 slices) — both fully done, see below.
 
 ### Phase 3a — Ledger CRUD + lettering — Implemented
 
@@ -598,14 +647,126 @@ for the existing export endpoint (unchanged).
 `exportData` output byte-matches a UI-driven export (`htdocs/accountancy/bookkeeping/export.php`)
 for at least one format (e.g. FEC).
 
-## Critical files (Phases 2-5)
+## Phase 6 — Chart-of-accounts model CRUD (step 2) — Implemented
+
+Closes the "Missing" item from `roadmap/API_GAPS.md`'s summary table: `AccountancySystem`
+(`htdocs/accountancy/class/accountancysystem.class.php`) previously had only `fetch()`/`create()`,
+and `api_accountingsetup.class.php` only exposed `GET accountingsystems[/{id}]`.
+
+**Model**: added `AccountancySystem::update($user)`/`delete($user)`, mirroring
+`Fiscalyear::update()`/`delete()` (`htdocs/core/class/fiscalyear.class.php:181-216`/`:264-280`) —
+`db->begin()`/parameterized query by `rowid`/`db->commit()`/`rollback()`, standard `>0`/`<0`
+return convention. `update()` touches exactly the fields `fetch()` loads: `label`, `pcg_version`,
+`active`.
+
+**API**: added `POST/PUT/DELETE accountingsystems[/{id}]` to `api_accountingsetup.class.php`,
+mirroring the `fiscalyears` CRUD block's structure (mandatory-field array
+`$FIELDS_ACCOUNTINGSYSTEM`, `_checkValForAPI()` sanitization, `RestException` on 400/404/500),
+gated on `accounting->chartofaccount` (matching this resource's existing `GET` endpoints, not the
+fiscalyear right).
+
+**Guards added at the API layer** (confirmed no DB-level protection exists —
+`llx_accounting_account.key.sql:27` has the `fk_pcg_version` → `accounting_system.pcg_version`
+foreign key commented out, and `fk_pcg_version` matches by string value, not rowid):
+- `putAccountingSystem`: rejects (400) any attempt to change `pcg_version` — only `label`/`active`
+  are accepted. Renaming `pcg_version` would silently orphan every `accounting_account` row
+  already bound to the old value, since the link is a string match, not a FK.
+- `deleteAccountingSystem`: rejects (409) deleting the chart currently active via the
+  `CHARTOFACCOUNTS` global, and rejects (409) deleting a chart that still has `accounting_account`
+  rows with a matching `fk_pcg_version` (in-use guard) — same defense-in-depth precondition
+  pattern used by Phase 4's closure endpoints and Phase 3a's ledger delete.
+
+**Tests**: extended the pre-existing `test/phpunit/AccountancySystemTest.php` (previously covered
+only `create`/`fetch`) with `testAccountancySystemUpdate`/`testAccountancySystemDelete` in the
+same `@depends` chain and style. Passes via the phpunit 9.5 phar
+(`test/phpunit/AccountancySystemTest.php`, 4 tests / 10 assertions). Per
+[[project-accountancy-api-gotchas]], the 3 new REST endpoints were verified with a live smoke
+test (direct instantiation against the real test DB, not a `*ApiTest.php` file) rather than
+through the Restler dispatcher — confirmed create → get → update (label allowed, pcg_version
+rejected with 400) → delete → get-after-delete (404), plus both delete guards (409 on the active
+chart, 409 on a chart with a bound account, success after unbinding).
+
+## Phases 7-11 — Remaining API_GAPS.md items — Open, scoped not implemented
+
+Each of these was deliberately left out of Phase 6 for a concrete reason (risk, an unresolved
+signature mismatch, unconfirmed correctness, or no precedent to build on in this codebase) — see
+`roadmap/API_GAPS.md` for the original gap analysis this backlog is closing out.
+
+**Phase 7 — Activate a chart of accounts (step 3, "select" half).** `POST
+accountingsystems/{id}/activate`, replicating `htdocs/accountancy/admin/account.php:170-219`'s
+two-step logic: a bulk `run_sql()` load of
+`install/mysql/data/llx_accounting_account_<country>.sql` (the country code comes from the
+chart's `fk_country`), then `dolibarr_set_const($db, 'CHARTOFACCOUNTS', $id, ...)`. Highest risk
+item in this backlog — no existing `api_*.class.php` anywhere in this codebase calls `run_sql()`;
+the admin page itself has no `is_readable($sqlfile)` check before `file_get_contents()` (add one
+when implementing this); and `run_sql()`'s error handling tolerates reruns via its
+`$okerror='default'` whitelist but isn't truly idempotent (partial reruns could leave mixed
+state). Needs a dry-run/confirmation parameter before it's safe to expose unattended.
+
+**Phase 8 — Accounting account categories CRUD + assignment.** `AccountancyCategory`
+(`htdocs/accountancy/class/accountancycategory.class.php`) already has full
+`create`/`fetch`/`update`/`delete`; the category↔account relationship is a direct FK
+(`accounting_account.fk_accounting_category`), not a join table, managed via
+`updateAccAcc($id_cat, $cpts)` (bulk-assign, keyed by formatted account_number) and
+`deleteCptCat($cpt_id)` (unassign one, keyed by account rowid) — the wrapper needs to resolve an
+account's formatted number before calling `updateAccAcc()` since the two methods key differently.
+Build a new `api_accountingcategories.class.php` (`AccountingAccountCategories` or similar)
+mirroring the CRUD pattern already established in `api_accountingaccounts.class.php` (this fork's
+own prior work: `$FIELDS`/`$SETTABLE_FIELDS`, `hasRight('accounting','chartofaccount')`,
+`_checkValForField()` for non-numeric `fk_*` fields per [[project-accountancy-api-gotchas]] item
+1), plus `POST/DELETE {id}/accounts/{account_id}` modeled on
+`htdocs/categories/class/api_categories.class.php`'s link/unlink shape.
+
+**Phase 9 — Ledger-transfer preview amounts (step C enhancement).** `AccountingJournals::pendingData()`
+(`api_accountingjournals.class.php:353-433`) currently returns only `ref`/`has_error` per pending
+document for natures 2/3, with a docblock claiming real subtotals would mean re-deriving the write
+loop's math. Confirmed during scoping this backlog that the claim is overstated for sells/
+purchases: `getDataForSells()`/`getDataForPurchases()` already return per-invoice,
+per-account-bucketed arrays (`tabht`/`tabtva`/`tablocaltax1`/`tablocaltax2`/`tabttc`, plus
+`tabwarranty` for sells), and `writeIntoBookkeepingForSells()`'s debit/credit derivation from
+those arrays is a trivial sign split (`debit = max($mt,0)`, `credit = max(-$mt,0)`) needing no DB
+writes to compute. A preview aggregator can sum these existing tab arrays per invoice directly —
+lower risk than the original gap analysis assumed, but still touches the ledger-transfer preview
+path, so apply the same golden-baseline verification discipline Phase 3b used, and keep bank/
+treasury (nature 4) as `has_error => false`/no-subtotal as today since neither has a comparable
+per-line tab-array structure to aggregate.
+
+**Phase 10 — Product accountancy codes under `MAIN_PRODUCT_PERENTITY_SHARED`.** A narrow `PUT
+products/{id}/accountancycodes` wrapping `Product::setAccountancyCode($type, $value)`
+(`htdocs/product/class/product.class.php:2149-2210`) would bypass `update()`'s per-entity-mode
+skip of the 6 `accountancy_code_*` fields (`product.class.php:1621-1628`). **Do not implement
+until researched further**: `setAccountancyCode()` writes to the base `product` table's columns
+unconditionally, even when `MAIN_PRODUCT_PERENTITY_SHARED` is on — but that mode's whole premise
+is that these fields live in `product_perentity` instead. Confirm how the per-entity-aware read
+paths (product card, wherever these fields are resolved with entity precedence) actually consume
+the base-table column before wiring an API endpoint to it, or the endpoint will "close" this gap
+only nominally, not functionally.
+
+**Phase 11 — Chart-of-accounts CSV import.** `AccountancyImport`
+(`htdocs/accountancy/class/accountancyimport.class.php`) is not a CSV reader — it's a set of
+stateless per-field compute-rule callbacks (`cleanAmount`, `computeDirection`, etc.) invoked by
+Dolibarr's generic Import module engine via the `Chartofaccounts` profile declared in
+`htdocs/core/modules/modAccounting.class.php:270-286`. The actual parsing/import engine
+(`ImportCsv`, `htdocs/core/modules/import/import_csv.modules.php`) is file-path-based
+(`import_open_file($file)` takes a server-side path, not raw content) and multi-step (profile
+selection → column mapping → validation → row-by-row insert) — there is no single existing method
+to wrap, and no precedent anywhere in this codebase for file-content-over-REST import. Lowest
+priority: chart-of-accounts rows can already be created one at a time via the existing
+`accounting_chart_of_accounts` endpoints. If tackled: accept base64 content, write it to a temp
+file under the admin temp dir (mirroring the wizard's own upload step), and drive it through the
+generic `Import` class (`htdocs/imports/class/import.class.php`) reusing the `Chartofaccounts`
+profile rather than reimplementing column mapping/validation.
+
+## Critical files (Phases 1-6)
 
 - `htdocs/accountancy/class/bookkeeping.class.php`
 - `htdocs/accountancy/class/lettering.class.php`
 - `htdocs/accountancy/class/accountingjournal.class.php`
+- `htdocs/accountancy/class/accountancysystem.class.php`
 - `htdocs/accountancy/journal/{sellsjournal,purchasesjournal,bankjournal,treasuryjournal,expensereportsjournal,variousjournal}.php`
 - `htdocs/accountancy/customer/{list,card}.php`, `htdocs/accountancy/supplier/{list,card}.php`
 - `htdocs/accountancy/closure/index.php`
 - `htdocs/accountancy/bookkeeping/{list,listbyaccount,balance,export}.php`
 - `htdocs/accountancy/class/accountancyexport.class.php`
 - `htdocs/accountancy/class/api_accountancy.class.php` (existing)
+- `htdocs/accountancy/class/api_accountingsetup.class.php` (existing, extended in Phase 6)

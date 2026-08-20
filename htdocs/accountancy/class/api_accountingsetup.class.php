@@ -40,6 +40,14 @@ class AccountingSetup extends DolibarrApi
 	);
 
 	/**
+	 * @var string[] Mandatory fields, checked when creating a chart-of-accounts model
+	 */
+	public static $FIELDS_ACCOUNTINGSYSTEM = array(
+		'pcg_version',
+		'label',
+	);
+
+	/**
 	 * Constructor
 	 */
 	public function __construct()
@@ -135,6 +143,146 @@ class AccountingSetup extends DolibarrApi
 		}
 
 		return $this->_cleanObjectDatas($system);
+	}
+
+	/**
+	 * Create a chart-of-accounts model.
+	 *
+	 * @param	array $request_data		Request data: pcg_version, label, active
+	 * @phan-param ?array<string,string> $request_data
+	 * @phpstan-param ?array<string,string> $request_data
+	 * @return	int						ID of chart-of-accounts model
+	 *
+	 * @url POST accountingsystems
+	 *
+	 * @throws RestException
+	 */
+	public function postAccountingSystem($request_data = null)
+	{
+		if (!DolibarrApiAccess::$user->hasRight('accounting', 'chartofaccount')) {
+			throw new RestException(403);
+		}
+
+		if ($request_data === null) {
+			$request_data = array();
+		}
+		foreach (self::$FIELDS_ACCOUNTINGSYSTEM as $field) {
+			if (!isset($request_data[$field])) {
+				throw new RestException(400, "$field field missing");
+			}
+		}
+
+		$system = new AccountancySystem($this->db);
+		$system->pcg_version = $this->_checkValForAPI('pcg_version', $request_data['pcg_version'], $system);
+		$system->label = $this->_checkValForAPI('label', $request_data['label'], $system);
+		$system->active = isset($request_data['active']) ? (int) $request_data['active'] : 0;
+
+		$result = $system->create(DolibarrApiAccess::$user);
+		if ($result < 0) {
+			throw new RestException(500, 'Error creating chart-of-accounts model: '.$system->error);
+		}
+		return $result;
+	}
+
+	/**
+	 * Update a chart-of-accounts model. Only label and active can be changed —
+	 * pcg_version is immutable via this endpoint because llx_accounting_account.fk_pcg_version
+	 * matches it by string value, not by rowid, so renaming it would silently orphan
+	 * every account already bound to the old value.
+	 *
+	 * @param	int    $id              ID of chart-of-accounts model
+	 * @param	array  $request_data    data: label, active
+	 * @phan-param ?array<string,string> $request_data
+	 * @phpstan-param ?array<string,string> $request_data
+	 * @return	Object					Object with cleaned properties
+	 *
+	 * @url PUT accountingsystems/{id}
+	 *
+	 * @throws RestException
+	 */
+	public function putAccountingSystem($id, $request_data = null)
+	{
+		if (!DolibarrApiAccess::$user->hasRight('accounting', 'chartofaccount')) {
+			throw new RestException(403);
+		}
+
+		$system = new AccountancySystem($this->db);
+		$result = $system->fetch($id);
+		if (!$result) {
+			throw new RestException(404, 'Chart-of-accounts model not found');
+		}
+
+		if ($request_data === null) {
+			$request_data = array();
+		}
+		if (isset($request_data['pcg_version']) && $request_data['pcg_version'] != $system->pcg_version) {
+			throw new RestException(400, 'pcg_version cannot be changed once created (it is referenced by string value from existing accounts)');
+		}
+		if (isset($request_data['label'])) {
+			$system->label = $this->_checkValForAPI('label', $request_data['label'], $system);
+		}
+		if (isset($request_data['active'])) {
+			$system->active = (int) $request_data['active'];
+		}
+
+		$result = $system->update(DolibarrApiAccess::$user);
+		if ($result < 0) {
+			throw new RestException(500, 'Error updating chart-of-accounts model: '.$system->error);
+		}
+		return $this->getAccountingSystem($id);
+	}
+
+	/**
+	 * Delete a chart-of-accounts model. Refused if it is the currently active chart
+	 * (CHARTOFACCOUNTS global) or if any accounting account still uses it, since
+	 * neither is enforced by a database constraint.
+	 *
+	 * @param	int    $id    ID of chart-of-accounts model
+	 * @return	array
+	 * @phan-return array{success:array{code:int,message:string}}
+	 * @phpstan-return array{success:array{code:int,message:string}}
+	 *
+	 * @url DELETE accountingsystems/{id}
+	 *
+	 * @throws RestException
+	 */
+	public function deleteAccountingSystem($id)
+	{
+		if (!DolibarrApiAccess::$user->hasRight('accounting', 'chartofaccount')) {
+			throw new RestException(403);
+		}
+
+		$system = new AccountancySystem($this->db);
+		$result = $system->fetch($id);
+		if (!$result) {
+			throw new RestException(404, 'Chart-of-accounts model not found');
+		}
+
+		if ((int) getDolGlobalInt('CHARTOFACCOUNTS') === (int) $id) {
+			throw new RestException(409, 'Cannot delete the currently active chart-of-accounts model');
+		}
+
+		$sql = "SELECT COUNT(*) as nb FROM ".MAIN_DB_PREFIX."accounting_account";
+		$sql .= " WHERE fk_pcg_version = '".$this->db->escape($system->pcg_version)."'";
+		$sqlresult = $this->db->query($sql);
+		if ($sqlresult) {
+			$obj = $this->db->fetch_object($sqlresult);
+			if ($obj && $obj->nb > 0) {
+				throw new RestException(409, 'Cannot delete a chart-of-accounts model that still has accounting accounts bound to it');
+			}
+		}
+
+		$result = $system->delete(DolibarrApiAccess::$user);
+		if ($result < 0) {
+			throw new RestException(500, 'Error deleting chart-of-accounts model: '.$system->error);
+		}
+
+		return array(
+			'success' => array(
+				'code' => 200,
+				'message' => 'Chart-of-accounts model deleted'
+			)
+		);
 	}
 
 
