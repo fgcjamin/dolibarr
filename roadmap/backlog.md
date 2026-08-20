@@ -6,8 +6,9 @@ Phases 1-5 are implemented and cover the 9-step setup workflow and the 5-step re
 (binding → ledger transfer → closure/reporting) described in the original request — a Dolibarr
 install can be driven through the accountancy module end to end via the API alone, with no UI step
 required. Phases 6-11 are a follow-up backlog written after auditing what's still missing beyond
-that core workflow (see `roadmap/API_GAPS.md` for the source analysis) — Phases 6, 7, 8, and 9 are
-implemented; Phases 10 and 11 are scoped but open.
+that core workflow (see `roadmap/API_GAPS.md` for the source analysis) — Phases 6, 7, 8, 9, and 11
+are implemented; Phase 10 is scoped but open, blocked pending further research (see its section
+below).
 
 | Phase | Scope | Status | Key files |
 |---|---|---|---|
@@ -22,7 +23,7 @@ implemented; Phases 10 and 11 are scoped but open.
 | 8 | Accounting account categories CRUD + assignment | Done | `accountancycategory.class.php` (bug fix in `create()`), new `api_accountingcategories.class.php` |
 | 9 | Ledger-transfer preview amounts (step C enhancement) | Done | `accountingjournal.class.php` (`getPreviewAmountsForSells()`/`getPreviewAmountsForPurchases()`), `api_accountingjournals.class.php` (`pendingData()`) |
 | 10 | Product accountancy codes under `MAIN_PRODUCT_PERENTITY_SHARED` | Open — needs research first | `product.class.php`, `api_products.class.php` |
-| 11 | Chart-of-accounts CSV import | Open | `accountancyimport.class.php`, `modAccounting.class.php` import profiles |
+| 11 | Chart-of-accounts CSV import | Done | new `api_accountingimport.class.php` |
 
 **One non-blocking follow-up, not a functional gap**: `test/phpunit/AccountingBindTest.php`
 (Phase 2) exercises `AccountingAccount::bindInvoiceLine()`/`unbindInvoiceLine()` directly, not the
@@ -913,11 +914,11 @@ via the CI-matching `bootstrap_action.php` bootstrap) passes clean on both modif
 files; running it against the two modified test files surfaces only pre-existing PHPUnit-stub
 noise (confirmed identical on an untouched sibling test file), nothing specific to the new code.
 
-## Phases 10-11 — Remaining API_GAPS.md items — Open, scoped not implemented
+## Phase 10 — Remaining API_GAPS.md item — Open, scoped not implemented
 
-Each of these was deliberately left out of Phases 6, 7, 8, and 9 for a concrete reason (risk, an
-unresolved signature mismatch, unconfirmed correctness, or no precedent to build on in this
-codebase) — see `roadmap/API_GAPS.md` for the original gap analysis this backlog is closing out.
+Deliberately left out of Phases 6, 7, 8, 9, and 11 for a concrete reason (risk, an unresolved
+signature mismatch, unconfirmed correctness, or no precedent to build on in this codebase) — see
+`roadmap/API_GAPS.md` for the original gap analysis this backlog is closing out.
 
 **Phase 10 — Product accountancy codes under `MAIN_PRODUCT_PERENTITY_SHARED`.** A narrow `PUT
 products/{id}/accountancycodes` wrapping `Product::setAccountancyCode($type, $value)`
@@ -930,22 +931,88 @@ paths (product card, wherever these fields are resolved with entity precedence) 
 the base-table column before wiring an API endpoint to it, or the endpoint will "close" this gap
 only nominally, not functionally.
 
-**Phase 11 — Chart-of-accounts CSV import.** `AccountancyImport`
-(`htdocs/accountancy/class/accountancyimport.class.php`) is not a CSV reader — it's a set of
-stateless per-field compute-rule callbacks (`cleanAmount`, `computeDirection`, etc.) invoked by
-Dolibarr's generic Import module engine via the `Chartofaccounts` profile declared in
-`htdocs/core/modules/modAccounting.class.php:270-286`. The actual parsing/import engine
-(`ImportCsv`, `htdocs/core/modules/import/import_csv.modules.php`) is file-path-based
-(`import_open_file($file)` takes a server-side path, not raw content) and multi-step (profile
-selection → column mapping → validation → row-by-row insert) — there is no single existing method
-to wrap, and no precedent anywhere in this codebase for file-content-over-REST import. Lowest
-priority: chart-of-accounts rows can already be created one at a time via the existing
-`accounting_chart_of_accounts` endpoints. If tackled: accept base64 content, write it to a temp
-file under the admin temp dir (mirroring the wizard's own upload step), and drive it through the
-generic `Import` class (`htdocs/imports/class/import.class.php`) reusing the `Chartofaccounts`
-profile rather than reimplementing column mapping/validation.
+## Phase 11 — Chart-of-accounts CSV import — Implemented
 
-## Critical files (Phases 1-9)
+Closes the last open item from `roadmap/API_GAPS.md`'s summary table other than Phase 10.
+`AccountancyImport` (`htdocs/accountancy/class/accountancyimport.class.php`) turned out to be a
+red herring for this phase — it's a set of stateless per-field compute-rule callbacks
+(`cleanAmount`, `computeDirection`, etc.) used only by the *general ledger* import profile, not
+the `Chartofaccounts` one, so it needed no changes. The `Chartofaccounts` profile itself
+(`htdocs/core/modules/modAccounting.class.php:270-287`, `import_code = 'accounting_1'` since
+`$this->rights_class = 'accounting'` — confirmed via grep, not the initially-guessed `compta_1`)
+declares 9 fields in a fixed order (`fk_pcg_version*`, `account_number*`, `label*`,
+`account_parent`, `fk_accounting_category`, `pcg_type*`, `centralized*`, `active*`, `datec`, 6 of
+them mandatory) with `fk_pcg_version`+`account_number` pre-declared as update-vs-insert matching
+keys.
+
+**No precedent existed for file-content-over-REST import anywhere in this codebase, and the real
+driver sequence for Dolibarr's generic Import engine lives only as inline procedural code inside
+the interactive wizard page** (`htdocs/imports/import.php`'s step 5/6 action blocks,
+`import.php:1580-1980` simulate and `import.php:2080-2420` real run — not an extracted reusable
+method). Reconstructing that sequence headlessly was this phase's actual work:
+`Import::load_arrays($user, 'accounting_1')` → `ImportCsv::import_get_nb_of_lines()` →
+`import_open_file()` → loop `import_read_record()`/`import_insert()` → `import_close_file()`,
+with the real (non-simulated) commit policy mirrored exactly: roll back immediately if any line
+produced an error, otherwise run the profile's `array_import_run_sql_after` (empty for this
+profile) and commit.
+
+**Model**: no changes — `AccountancyImport`, `Import`, `ImportCsv`, and the `Chartofaccounts`
+profile declaration were all already correct. This phase is a pure orchestration wrapper, same
+shape as Phase 7's `activate()` (mirrors the wizard's existing logic rather than refactoring the
+wizard page itself, consistent with this backlog's scope-decision convention for follow-up-scope
+phases).
+
+**API**: new `htdocs/accountancy/class/api_accountingimport.class.php` (`AccountingImport extends
+DolibarrApi`), one endpoint: `POST accountingsystems/importchart`, gated on
+`accounting->chartofaccount` (matching every chart-of-accounts-adjacent endpoint from Phases 6/7,
+rather than the generic wizard's own `import->run` right). Accepts `filecontent`
+(raw or, with `fileencoding: 'base64'`, base64-encoded — same convention as
+`api_documents.class.php`'s `post()`), `filename` (cosmetic, sanitized), `excludefirstline`
+(number of leading lines to skip, default 1), `updateifexists` (opt-in update-vs-insert, default
+insert-only), and `simulate` (always rolls back, for a dry-run preview). **Deliberate scope
+simplification, not present in the wizard**: the endpoint requires the CSV's 9 columns to already
+be in the profile's exact declared field order — `array_match_file_to_database` is built
+positionally from `array_keys($objimport->array_import_fields[0])` rather than accepting a
+caller-supplied column-mapping structure, since building a general column-mapping mini-language
+for a REST body was judged out of proportion to this single fixed-schema dataset (the wizard's own
+first-load auto-mapping falls back to this exact same positional assignment —
+`import.php:877-894` — so this isn't a new behavior, just skipping the interactive override step).
+The temp file is written to `$conf->import->dir_temp` (`DOL_DATA_ROOT/import/temp`, the same
+directory the wizard itself uses) and deleted at the end of the request — unlike the wizard, which
+keeps it around for a multi-step session, this endpoint receives fresh content each call, so
+nothing depends on the file surviving past the request; `dolCheckVirus()` runs before the file is
+ever opened for import, matching `api_documents.class.php`'s upload-content precedent.
+
+**Verification**: `parallel-lint` (`php -l`, `vendor/bin/parallel-lint` isn't installed in this
+environment per `CLAUDE.md`'s disabled-composer note) and `phpstan` (level 10, via the
+CI-matching `bootstrap_action.php` bootstrap per [[project-accountancy-api-gotchas]] item 10) both
+pass clean on the new file, no baseline suppressions. Verified end-to-end with a live smoke test
+(direct instantiation against the real local test DB, matching every prior phase's pattern) using
+the `PCG25-DEV` chart-of-accounts model (already seeded and active in the test DB) with a 2-row
+CSV fixture: `simulate: true` (2 rows report `nbok`, zero committed rows land) → real run
+(`committed: true`, 2 rows land) → re-run with `updateifexists: true` and a changed label (updates
+in place, still 2 rows, not 4) → a deliberately malformed row (missing mandatory `Label`) in a
+2-row batch (whole request rolls back, zero rows land from either line — all-or-nothing, matching
+the wizard's own real-run commit policy) → confirmed the temp file under `$conf->import->dir_temp`
+is gone after every request, success or failure. All 5 checks passed.
+
+**Gotchas found during implementation** (added to
+[[project-accountancy-api-gotchas]] as items 33-35): a CLI smoke-test harness booting through the
+lighter `master.inc.php` (per item 2/18's established pattern) is missing two functions this
+endpoint's dependencies need at runtime — `dolCheckVirus()`/`dolChmod()`/`dol_delete_file()`
+(from `core/lib/files.lib.php`, not auto-loaded by `master.inc.php`) and `testSqlAndScriptInject()`
+(from `waf.inc.php`, loaded only by the full `main.inc.php` chain the real REST dispatcher
+actually uses via `api/index.php`). Neither needed an explicit `require` inside the production API
+file itself — the real REST dispatcher already loads both — but a smoke-test harness must
+`require_once` both manually (`waf.inc.php` documents itself as having "no dependency with any
+other code", safe to require standalone). Also confirmed a pre-existing, harmless quirk in
+Dolibarr's own `import_csv.modules.php` (`import_insert()` line 714,
+`if (!is_array($this->cachefieldtable[$cachekey]))` on a never-yet-set array key) — a
+notice-level "undefined array key" under strict error reporting on every call, not something
+introduced by or worth fixing in this phase (same class of "existing quirk, preserved not fixed"
+documented for other journals' pre-existing behavior throughout this backlog).
+
+## Critical files (Phases 1-9, 11)
 
 - `htdocs/accountancy/class/bookkeeping.class.php`
 - `htdocs/accountancy/class/lettering.class.php`
@@ -964,3 +1031,9 @@ profile rather than reimplementing column mapping/validation.
 - `htdocs/accountancy/class/api_accountingsetup.class.php` (existing, extended in Phases 6 and 7)
 - `htdocs/accountancy/admin/account.php` (reference only — Phase 7's `activate()` mirrors its
   logic but does not modify this file)
+- `htdocs/accountancy/class/api_accountingimport.class.php` (new in Phase 11)
+- `htdocs/imports/class/import.class.php`, `htdocs/core/modules/import/import_csv.modules.php`,
+  `htdocs/core/modules/modAccounting.class.php` (`Chartofaccounts` profile) — existing, reused
+  as-is by Phase 11's headless driver
+- `htdocs/imports/import.php` (reference only — Phase 11's driver sequence mirrors its step 5/6
+  action blocks but does not modify this file)
