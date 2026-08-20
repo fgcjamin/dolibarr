@@ -285,6 +285,132 @@ class AccountingSetup extends DolibarrApi
 		);
 	}
 
+	/**
+	 * Resolve the country code and chart-of-accounts data file for a chart-of-accounts model,
+	 * shared by the activation preview and activation endpoints below.
+	 *
+	 * @param	int		$id		ID of chart-of-accounts model
+	 * @return	array
+	 * @phan-return array{country_code:string,sqlfile:string,sqlfile_readable:bool}
+	 * @phpstan-return array{country_code:string,sqlfile:string,sqlfile_readable:bool}
+	 *
+	 * @throws RestException
+	 */
+	private function _resolveActivationCountryCode($id)
+	{
+		$sql = "SELECT code FROM ".MAIN_DB_PREFIX."c_country as c, ".MAIN_DB_PREFIX."accounting_system as a";
+		$sql .= " WHERE c.rowid = a.fk_country AND a.rowid = ".((int) $id);
+		$resql = $this->db->query($sql);
+		if (!$resql) {
+			throw new RestException(503, 'Error resolving country for chart-of-accounts model: '.$this->db->lasterror());
+		}
+		$obj = $this->db->fetch_object($resql);
+		$country_code = ($obj && !empty($obj->code)) ? $obj->code : '';
+		$sqlfile = $country_code ? DOL_DOCUMENT_ROOT.'/install/mysql/data/llx_accounting_account_'.strtolower($country_code).'.sql' : '';
+
+		return array(
+			'country_code' => $country_code,
+			'sqlfile' => $sqlfile,
+			'sqlfile_readable' => ($sqlfile !== '' && is_readable($sqlfile)),
+		);
+	}
+
+	/**
+	 * Preview what activating this chart-of-accounts model would do, without making any change:
+	 * the country-specific chart-of-accounts data file that would be loaded, whether it exists
+	 * and is readable, and whether this model is already the active one. Read-only — does not
+	 * call run_sql() or dolibarr_set_const(). Call this before POST .../activate.
+	 *
+	 * @param	int		$id		ID of chart-of-accounts model
+	 * @return	array
+	 * @phan-return array{id:int,country_code:string,sqlfile:string,sqlfile_readable:bool,already_active:bool}
+	 * @phpstan-return array{id:int,country_code:string,sqlfile:string,sqlfile_readable:bool,already_active:bool}
+	 *
+	 * @url GET accountingsystems/{id}/activate/preview
+	 *
+	 * @throws RestException
+	 */
+	public function getAccountingSystemActivatePreview($id)
+	{
+		if (!DolibarrApiAccess::$user->hasRight('accounting', 'chartofaccount')) {
+			throw new RestException(403);
+		}
+
+		$system = new AccountancySystem($this->db);
+		$result = $system->fetch($id);
+		if (!$result) {
+			throw new RestException(404, 'Chart-of-accounts model not found');
+		}
+
+		$resolved = $this->_resolveActivationCountryCode($id);
+
+		return array(
+			'id' => (int) $id,
+			'country_code' => $resolved['country_code'],
+			'sqlfile' => $resolved['sqlfile'],
+			'sqlfile_readable' => $resolved['sqlfile_readable'],
+			'already_active' => ((int) getDolGlobalInt('CHARTOFACCOUNTS') === (int) $id),
+		);
+	}
+
+	/**
+	 * Activate a chart-of-accounts model: bulk-loads its country's chart-of-accounts data file
+	 * into llx_accounting_account and points the CHARTOFACCOUNTS global at it. This is a
+	 * high-impact operation that is not fully idempotent on reruns (see
+	 * AccountancySystem::activate()), so callers must pass confirm=true explicitly, and
+	 * re-activating the model that is already active is rejected outright rather than silently
+	 * reloading it. Call GET accountingsystems/{id}/activate/preview first to see what this
+	 * would do.
+	 *
+	 * @param	int		$id				ID of chart-of-accounts model
+	 * @param	array	$request_data	Request data: confirm (must be true)
+	 * @phan-param ?array<string,mixed> $request_data
+	 * @phpstan-param ?array<string,mixed> $request_data
+	 * @return	array
+	 * @phan-return array{accountingsystem:Object,country_code:string,sqlfile:string}
+	 * @phpstan-return array{accountingsystem:Object,country_code:string,sqlfile:string}
+	 *
+	 * @url POST accountingsystems/{id}/activate
+	 *
+	 * @throws RestException
+	 */
+	public function postAccountingSystemActivate($id, $request_data = null)
+	{
+		if (!DolibarrApiAccess::$user->hasRight('accounting', 'chartofaccount')) {
+			throw new RestException(403);
+		}
+
+		$system = new AccountancySystem($this->db);
+		$result = $system->fetch($id);
+		if (!$result) {
+			throw new RestException(404, 'Chart-of-accounts model not found');
+		}
+
+		if ($request_data === null) {
+			$request_data = array();
+		}
+		if (empty($request_data['confirm'])) {
+			throw new RestException(400, 'Set confirm=true to actually activate this chart of accounts. Call GET accountingsystems/{id}/activate/preview first to see what this will do.');
+		}
+
+		if ((int) getDolGlobalInt('CHARTOFACCOUNTS') === (int) $id) {
+			throw new RestException(409, 'This chart of accounts is already active; re-running the load is not supported');
+		}
+
+		$resolved = $this->_resolveActivationCountryCode($id);
+
+		$result = $system->activate(DolibarrApiAccess::$user);
+		if ($result < 0) {
+			throw new RestException(500, 'Error activating chart-of-accounts model: '.$system->error);
+		}
+
+		return array(
+			'accountingsystem' => $this->getAccountingSystem($id),
+			'country_code' => $resolved['country_code'],
+			'sqlfile' => $resolved['sqlfile'],
+		);
+	}
+
 
 	/**
 	 * Get the list of fiscal years.

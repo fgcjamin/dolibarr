@@ -6,8 +6,8 @@ Phases 1-5 are implemented and cover the 9-step setup workflow and the 5-step re
 (binding → ledger transfer → closure/reporting) described in the original request — a Dolibarr
 install can be driven through the accountancy module end to end via the API alone, with no UI step
 required. Phases 6-11 are a follow-up backlog written after auditing what's still missing beyond
-that core workflow (see `roadmap/API_GAPS.md` for the source analysis) — Phases 6 and 8 are
-implemented; Phases 7, 9, 10, and 11 are scoped but open.
+that core workflow (see `roadmap/API_GAPS.md` for the source analysis) — Phases 6, 7, and 8 are
+implemented; Phases 9, 10, and 11 are scoped but open.
 
 | Phase | Scope | Status | Key files |
 |---|---|---|---|
@@ -18,7 +18,7 @@ implemented; Phases 7, 9, 10, and 11 are scoped but open.
 | 4 | Period closure (step E) | Done | `api_accountancy.class.php` (`fiscalperiods/*`) |
 | 5 | Reporting/exports (step D) | Done | `api_accountancy.class.php` (`ledger`, `ledger/balance`, `exportData`) |
 | 6 | Chart-of-accounts model CRUD (step 2) | Done | `accountancysystem.class.php` (`update`/`delete`), `api_accountingsetup.class.php` (`accountingsystems` POST/PUT/DELETE) |
-| 7 | Activate a chart of accounts (step 3, "select" half) | Open | `htdocs/accountancy/admin/account.php`, `api_accountingsetup.class.php` |
+| 7 | Activate a chart of accounts (step 3, "select" half) | Done | `accountancysystem.class.php` (`activate()`), `api_accountingsetup.class.php` (`accountingsystems/{id}/activate[/preview]`) |
 | 8 | Accounting account categories CRUD + assignment | Done | `accountancycategory.class.php` (bug fix in `create()`), new `api_accountingcategories.class.php` |
 | 9 | Ledger-transfer preview amounts (step C enhancement) | Open | `api_accountingjournals.class.php` (`pendingData()`) |
 | 10 | Product accountancy codes under `MAIN_PRODUCT_PERENTITY_SHARED` | Open — needs research first | `product.class.php`, `api_products.class.php` |
@@ -686,6 +686,72 @@ through the Restler dispatcher — confirmed create → get → update (label al
 rejected with 400) → delete → get-after-delete (404), plus both delete guards (409 on the active
 chart, 409 on a chart with a bound account, success after unbinding).
 
+## Phase 7 — Activate a chart of accounts (step 3, "select" half) — Implemented
+
+Closes the "Missing" item from `roadmap/API_GAPS.md`'s summary table for actually *selecting* a
+chart of accounts (Phase 6 covers CRUD on the chart-of-accounts *models* themselves). Flagged as
+the highest-risk item in this backlog: no existing `api_*.class.php` anywhere in this codebase
+called `run_sql()` before this phase, the admin page it mirrors
+(`htdocs/accountancy/admin/account.php:170-219`) has no `is_readable($sqlfile)` guard before
+`file_get_contents()`, and `run_sql()`'s error handling tolerates *some* reruns via its
+`$okerror='default'` whitelist but isn't truly idempotent — a partial rerun could leave mixed
+state.
+
+**Model**: new `AccountancySystem::activate($user)`
+(`htdocs/accountancy/class/accountancysystem.class.php`) — a faithful mirror of the admin page's
+two-step logic (resolve country code via a `c_country`/`accounting_system` join, `run_sql()` the
+matching `install/mysql/data/llx_accounting_account_<country>.sql` with the same offset math,
+then `dolibarr_set_const($db, 'CHARTOFACCOUNTS', $this->id, ...)`), plus one guard the page
+itself lacks: `is_readable($sqlfile)` before touching it, failing cleanly (`$this->error` set,
+negative return) instead of a raw file-read warning. Deliberately **not** a refactor of
+`account.php` itself onto the new method — unlike Phase 3's ledger-transfer logic (called out by
+this backlog's own scope decisions for UI/API sharing because it was original core-workflow
+scope), Phase 7 is follow-up scope and touching a live admin page's chart-loading logic was judged
+out of proportion to this phase's goal; `activate()` mirrors the page, it doesn't absorb it —
+consistent with how Phases 6 and 8 added new model methods without touching their sibling UI
+pages. `admin.lib.php` (for `run_sql()`/`dolibarr_set_const()`) is now `require_once` at the top
+of `accountancysystem.class.php` itself, so the class is self-contained regardless of what already
+required it in a given call path.
+
+**API**: two new endpoints on `AccountingSetup`
+(`htdocs/accountancy/class/api_accountingsetup.class.php`), gated on `accounting->chartofaccount`
+(matching every other endpoint on this resource) — a safety design confirmed with the user before
+implementation, since this is a high-impact, not-fully-idempotent write:
+- `GET accountingsystems/{id}/activate/preview` — read-only, no `run_sql()`/`dolibarr_set_const()`
+  call. Resolves and returns `{id, country_code, sqlfile, sqlfile_readable, already_active}` via a
+  shared private `_resolveActivationCountryCode($id)` helper (used by both endpoints so the
+  country/sqlfile resolution logic isn't duplicated between them).
+- `POST accountingsystems/{id}/activate` `{confirm: true}` — 400 if `confirm` is missing/falsy
+  (message points callers at the preview endpoint first); **409 if the target model is already the
+  active chart** (`CHARTOFACCOUNTS` already equals `{id}`) — a hard reject with no override,
+  matching this backlog's existing conservative guard style (Phase 6/8's delete guards have no
+  override either) rather than risking a partial-rerun's mixed state; otherwise calls `activate()`
+  and returns the updated `AccountancySystem` object plus the resolved `country_code`/`sqlfile` for
+  confirmation. Returns a plain array (not a mutated `AccountancySystem` instance with extra
+  properties bolted on) to avoid a PHP 8.2 dynamic-property deprecation, since `country_code`/
+  `sqlfile` aren't declared properties on that class.
+
+**Verification**: `test/phpunit/AccountancySystemActivateTest.php` — activates the
+already-seeded Swedish chart-of-accounts model (`llx_accounting_system` row for `BAS-K1-MINI`,
+from `install/mysql/data/llx_accounting_system.sql`'s standard seed data, not a test-only
+fixture), chosen because its data file (`llx_accounting_account_se.sql`, 60 lines) is the smallest
+of all 37 supported countries, keeping the test fast; asserts new `llx_accounting_account` rows
+land and `CHARTOFACCOUNTS` updates. A second test confirms a freshly `create()`d model (which has
+no `fk_country` — `create()` never writes that column) fails activation cleanly rather than
+warning. Passes via the phpunit 9.5 phar (2 tests / 6 assertions); confirmed the outer
+`setUpBeforeClass()`/`tearDownAfterClass()` transaction wrapping (per
+[[project-accountancy-api-gotchas]] item 10) fully rolls back `run_sql()`'s and
+`dolibarr_set_const()`'s writes — both call `$db->query()` per-statement with no independent
+commit, so nesting inside the outer transaction holds; verified directly by querying the DB after
+the test run and finding `CHARTOFACCOUNTS` and the Swedish account-row count unchanged. The two new
+REST endpoints were additionally verified end-to-end with a live smoke test (direct instantiation
+against the real test DB, matching the Phase 6/8 pattern, wrapped in its own manual
+`$db->begin()`/`rollback()`): preview (`already_active: false`) → POST without `confirm` (400) →
+POST with `confirm: true` (success, `CHARTOFACCOUNTS` updated) → preview again
+(`already_active: true`) → POST again (409) → preview on a nonexistent id (404) — all passed, and
+a post-rollback DB check confirmed zero permanent changes. `phpstan` (level 10, via the
+CI-matching `bootstrap_action.php` bootstrap) passes clean on both modified files.
+
 ## Phase 8 — Accounting account categories CRUD + assignment — Implemented
 
 Closes the "Missing" item from `roadmap/API_GAPS.md`'s summary table: `AccountancyCategory`
@@ -775,25 +841,11 @@ sessions, not a per-script workaround. Also note for future fixtures in this cod
 model methods (including `updateAccAcc()`, `getCptsCat()`) filter on `active = 1`, so any fixture
 account meant to participate in category/journal logic must set `->active = 1` before `create()`.
 
-## Phases 7, 9-11 — Remaining API_GAPS.md items — Open, scoped not implemented
+## Phases 9-11 — Remaining API_GAPS.md items — Open, scoped not implemented
 
-Each of these was deliberately left out of Phases 6 and 8 for a concrete reason (risk, an
+Each of these was deliberately left out of Phases 6, 7, and 8 for a concrete reason (risk, an
 unresolved signature mismatch, unconfirmed correctness, or no precedent to build on in this
 codebase) — see `roadmap/API_GAPS.md` for the original gap analysis this backlog is closing out.
-
-**Phase 7 — Activate a chart of accounts (step 3, "select" half).** `POST
-accountingsystems/{id}/activate`, replicating `htdocs/accountancy/admin/account.php:170-219`'s
-two-step logic: a bulk `run_sql()` load of
-`install/mysql/data/llx_accounting_account_<country>.sql` (the country code comes from the
-chart's `fk_country`), then `dolibarr_set_const($db, 'CHARTOFACCOUNTS', $id, ...)`. Highest risk
-item in this backlog — no existing `api_*.class.php` anywhere in this codebase calls `run_sql()`;
-the admin page itself has no `is_readable($sqlfile)` check before `file_get_contents()` (add one
-when implementing this); and `run_sql()`'s error handling tolerates reruns via its
-`$okerror='default'` whitelist but isn't truly idempotent (partial reruns could leave mixed
-state). Needs a dry-run/confirmation parameter before it's safe to expose unattended.
-
-**Phase 8 — Accounting account categories CRUD + assignment — see the "Phase 8" section above,
-now Implemented.**
 
 **Phase 9 — Ledger-transfer preview amounts (step C enhancement).** `AccountingJournals::pendingData()`
 (`api_accountingjournals.class.php:353-433`) currently returns only `ref`/`has_error` per pending
@@ -835,12 +887,12 @@ file under the admin temp dir (mirroring the wizard's own upload step), and driv
 generic `Import` class (`htdocs/imports/class/import.class.php`) reusing the `Chartofaccounts`
 profile rather than reimplementing column mapping/validation.
 
-## Critical files (Phases 1-6, 8)
+## Critical files (Phases 1-8)
 
 - `htdocs/accountancy/class/bookkeeping.class.php`
 - `htdocs/accountancy/class/lettering.class.php`
 - `htdocs/accountancy/class/accountingjournal.class.php`
-- `htdocs/accountancy/class/accountancysystem.class.php`
+- `htdocs/accountancy/class/accountancysystem.class.php` (`activate()` added in Phase 7)
 - `htdocs/accountancy/class/accountancycategory.class.php` (bug fix in `create()` in Phase 8)
 - `htdocs/accountancy/class/api_accountingcategories.class.php` (new in Phase 8)
 - `htdocs/accountancy/journal/{sellsjournal,purchasesjournal,bankjournal,treasuryjournal,expensereportsjournal,variousjournal}.php`
@@ -849,4 +901,6 @@ profile rather than reimplementing column mapping/validation.
 - `htdocs/accountancy/bookkeeping/{list,listbyaccount,balance,export}.php`
 - `htdocs/accountancy/class/accountancyexport.class.php`
 - `htdocs/accountancy/class/api_accountancy.class.php` (existing)
-- `htdocs/accountancy/class/api_accountingsetup.class.php` (existing, extended in Phase 6)
+- `htdocs/accountancy/class/api_accountingsetup.class.php` (existing, extended in Phases 6 and 7)
+- `htdocs/accountancy/admin/account.php` (reference only — Phase 7's `activate()` mirrors its
+  logic but does not modify this file)
