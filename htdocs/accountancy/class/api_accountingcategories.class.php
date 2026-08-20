@@ -301,10 +301,12 @@ class AccountingAccountCategories extends DolibarrApi
 	/**
 	 * Assign an accounting account to a category.
 	 *
-	 * AccountancyCategory::updateAccAcc() only matches accounts belonging to the currently
-	 * active chart of accounts (CHARTOFACCOUNTS) and silently does nothing (no SQL error) for
-	 * an account outside that chart — so the assignment is verified by re-fetching the account
-	 * afterward, rather than trusting updateAccAcc()'s own success return alone.
+	 * AccountancyCategory::updateAccAcc() matches accounts by account_number within the currently
+	 * active chart of accounts (CHARTOFACCOUNTS) and does not scope that match by row id. Calling it
+	 * with an account from a different (inactive) chart that happens to share its account_number with
+	 * an active-chart account would silently update that unrelated active-chart account instead. So
+	 * membership in the active chart is checked up front, before any mutation, rather than relying on
+	 * updateAccAcc()'s own success return.
 	 *
 	 * @param	int		$id			ID of accounting account category
 	 * @param	int		$account_id	ID of accounting account
@@ -325,15 +327,15 @@ class AccountingAccountCategories extends DolibarrApi
 			throw new RestException(404, 'Accounting account not found');
 		}
 
+		$accountincurrentchart = new AccountingAccount($this->db);
+		if (!$accountincurrentchart->fetch($account_id, null, 1)) {
+			throw new RestException(400, 'Accounting account is not part of the currently active chart of accounts (CHARTOFACCOUNTS) and could not be assigned');
+		}
+
 		$formatted = length_accountg($account->account_number);
 		$result = $category->updateAccAcc($id, array($formatted => "'".$formatted."'"));
 		if ($result < 0) {
 			throw new RestException(500, 'Error assigning accounting account to category: '.$category->error);
-		}
-
-		$account->fetch($account_id);
-		if ((int) $account->account_category !== (int) $id) {
-			throw new RestException(400, 'Accounting account is not part of the currently active chart of accounts (CHARTOFACCOUNTS) and could not be assigned');
 		}
 
 		return array(
