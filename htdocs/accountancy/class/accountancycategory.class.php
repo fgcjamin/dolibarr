@@ -242,6 +242,7 @@ class AccountancyCategory // extends CommonObject
 			$this->db->rollback();
 			return -1 * $error;
 		} else {
+			$this->id = $this->rowid = ($this->rowid > 0 ? $this->rowid : $this->db->last_insert_id($this->db->prefix().$this->table_element));
 			$this->db->commit();
 			return $this->id;
 		}

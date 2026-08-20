@@ -6,8 +6,8 @@ Phases 1-5 are implemented and cover the 9-step setup workflow and the 5-step re
 (binding → ledger transfer → closure/reporting) described in the original request — a Dolibarr
 install can be driven through the accountancy module end to end via the API alone, with no UI step
 required. Phases 6-11 are a follow-up backlog written after auditing what's still missing beyond
-that core workflow (see `roadmap/API_GAPS.md` for the source analysis) — Phase 6 is implemented;
-Phases 7-11 are scoped but open.
+that core workflow (see `roadmap/API_GAPS.md` for the source analysis) — Phases 6 and 8 are
+implemented; Phases 7, 9, 10, and 11 are scoped but open.
 
 | Phase | Scope | Status | Key files |
 |---|---|---|---|
@@ -19,7 +19,7 @@ Phases 7-11 are scoped but open.
 | 5 | Reporting/exports (step D) | Done | `api_accountancy.class.php` (`ledger`, `ledger/balance`, `exportData`) |
 | 6 | Chart-of-accounts model CRUD (step 2) | Done | `accountancysystem.class.php` (`update`/`delete`), `api_accountingsetup.class.php` (`accountingsystems` POST/PUT/DELETE) |
 | 7 | Activate a chart of accounts (step 3, "select" half) | Open | `htdocs/accountancy/admin/account.php`, `api_accountingsetup.class.php` |
-| 8 | Accounting account categories CRUD + assignment | Open | `accountancycategory.class.php`, new `api_accountingcategories.class.php` |
+| 8 | Accounting account categories CRUD + assignment | Done | `accountancycategory.class.php` (bug fix in `create()`), new `api_accountingcategories.class.php` |
 | 9 | Ledger-transfer preview amounts (step C enhancement) | Open | `api_accountingjournals.class.php` (`pendingData()`) |
 | 10 | Product accountancy codes under `MAIN_PRODUCT_PERENTITY_SHARED` | Open — needs research first | `product.class.php`, `api_products.class.php` |
 | 11 | Chart-of-accounts CSV import | Open | `accountancyimport.class.php`, `modAccounting.class.php` import profiles |
@@ -686,11 +686,100 @@ through the Restler dispatcher — confirmed create → get → update (label al
 rejected with 400) → delete → get-after-delete (404), plus both delete guards (409 on the active
 chart, 409 on a chart with a bound account, success after unbinding).
 
-## Phases 7-11 — Remaining API_GAPS.md items — Open, scoped not implemented
+## Phase 8 — Accounting account categories CRUD + assignment — Implemented
 
-Each of these was deliberately left out of Phase 6 for a concrete reason (risk, an unresolved
-signature mismatch, unconfirmed correctness, or no precedent to build on in this codebase) — see
-`roadmap/API_GAPS.md` for the original gap analysis this backlog is closing out.
+Closes the "Missing" item from `roadmap/API_GAPS.md`'s summary table: `AccountancyCategory`
+(`htdocs/accountancy/class/accountancycategory.class.php`) already had full
+`create`/`fetch`/`update`/`delete` plus `updateAccAcc()`/`deleteCptCat()`/`getCptsCat()` for the
+account↔category relationship, but no `api_*.class.php` anywhere referenced it.
+
+**One real bug found and fixed along the way, same class of issue as `BookKeeping::create()` in
+Phase 3b**: `AccountancyCategory::create()` returned `$this->id` on success, but `$this->id` is
+only ever assigned inside `fetch()` — `create()` itself never set it (no `last_insert_id()` call),
+so a fresh `create()` call returned whatever `$this->id` happened to already hold, not the new
+row's id. Unlike `BookKeeping::create()`'s fix (which needed a 12-call-site audit), `grep` found
+**zero existing callers** of `AccountancyCategory::create()` anywhere in the codebase — the UI
+(`htdocs/accountancy/admin/categories.php`) manages categories through Dolibarr's generic
+dictionary admin page, not this class — so this was a safe, isolated fix: capture the id via
+`$this->db->last_insert_id(...)` and set `$this->id = $this->rowid` before returning.
+
+**Two more real quirks found during implementation/testing, both confirmed and worked around
+rather than "fixed" (existing, in-scope behavior, not new bugs introduced by this phase)**:
+1. `AccountancyCategory::fetch($id)` always returns `1` when the SQL query itself succeeds, even
+   if no row matched the given id (unlike `AccountingAccount::fetch()`, which returns falsy) — the
+   row's fields are only populated inside an `if ($this->db->num_rows($resql))` guard. So the new
+   API's `_fetch()` helper checks `empty($category->id)` after `fetch()`, not `fetch()`'s own
+   return value, to decide 404.
+2. `code`/`label`/`range_account`/`sens`/`category_type`/`formula` all map to `NOT NULL` columns
+   on `c_accounting_category` with **no DB default** for `range_account`/`formula`
+   (`llx_c_accounting_category-accounting.sql`), and `create()`/`update()` write an explicit `NULL`
+   for any of them left unset on the object rather than omitting the column — confirmed via a live
+   query against the test DB that omitting any of the four beyond code/label throws a `NOT NULL`
+   constraint error. All six are listed as mandatory in the API's `$FIELDS`, not just the two
+   "identifying" fields a first read of the model suggests.
+
+**Model**: no other model changes — `updateAccAcc()`/`deleteCptCat()`/`getCptsCat()` were already
+correct and are used as-is.
+
+**API**: new `htdocs/accountancy/class/api_accountingcategories.class.php`
+(`AccountingAccountCategories extends DolibarrApi`), mirroring
+`api_accountingaccounts.class.php`'s established CRUD structure (`$FIELDS`/`$SETTABLE_FIELDS`,
+`_fetch()`, `index()` with sqlfilters/sort/pagination, `post()`/`put()`/`delete()` via
+`RestException`), gated on `accounting->chartofaccount` throughout (matching this resource
+family's existing convention). Plus 3 assignment endpoints modeled on
+`htdocs/categories/class/api_categories.class.php`'s link/unlink URL shape but collapsed to this
+model's actual mechanism — a direct FK column, not a join table, so no `add_type`/`del_type`
+equivalent:
+- `POST {id}/accounts/{account_id}` (`linkAccount()`) — fetches the target `AccountingAccount`,
+  formats its `account_number` via `length_accountg()`, calls `updateAccAcc()`. Since
+  `updateAccAcc()` only matches accounts belonging to the *currently active* chart of accounts
+  (`CHARTOFACCOUNTS`) and silently no-ops (no SQL error) for an account outside that chart, the
+  endpoint re-fetches the account afterward and verifies `account_category == $id` before
+  reporting success — trusting `updateAccAcc()`'s own return value alone would have made this
+  silent-no-op case look like a successful link. (Also confirmed while wiring this up:
+  `AccountingAccount::fetch()` maps the DB column `fk_accounting_category` to the PHP property
+  `$this->account_category`, not `$this->fk_accounting_category` — another misnamed-field trap in
+  the same family as `fk_pcg_version`, per [[project-accountancy-api-gotchas]] item 1.)
+- `DELETE {id}/accounts/{account_id}` (`unlinkAccount()`) — thin wrap of `deleteCptCat()`, which is
+  keyed directly by `accounting_account.rowid`, no pre-fetch needed.
+- `GET {id}/accounts` (`getAccounts()`) — thin wrap of `getCptsCat()`; added beyond the backlog's
+  original 2-endpoint sketch since without it there was no way to verify assignment state via the
+  API at all.
+
+**Guard added at the API layer** (same precondition pattern as Phase 6's `deleteAccountingSystem`
+and Phase 3a's ledger delete — no DB-level FK/cascade protects
+`accounting_account.fk_accounting_category` from going orphaned): `delete()` calls `getCptsCat()`
+first and rejects (409) if any accounts are still assigned to the category.
+
+**Tests**: new `test/phpunit/AccountancyCategoryTest.php`, following `AccountancySystemTest.php`'s
+`@depends`-chain style from Phase 6 (create → fetch → update → assignment round-trip via
+`updateAccAcc()`/`getCptsCat()`/`deleteCptCat()` against a fixture `AccountingAccount` seeded on
+the test DB's active chart of accounts → delete). Passes via the phpunit 9.5 phar (5 tests / 20
+assertions). The 3 new `AccountingAccountCategories` REST endpoints (plus the CRUD ones) were
+additionally verified end-to-end with a live smoke test (direct instantiation against the real
+test DB, matching Phase 6's approach) — create → get → put → link → list → delete-guard (409) →
+unlink → list (empty) → delete → get-after-delete (404) → link-with-missing-account (404) — all
+passed. `phpstan` (level 10, via the CI-matching `bootstrap_action.php` bootstrap) passes clean on
+both the new API file and the modified `accountancycategory.class.php`.
+
+**Test-environment gotcha found and fixed permanently in the shared test DB** (per
+[[project-accountancy-api-gotchas]] item 10's environment): `AccountancyCategory::getCptsCat()`
+calls `dol_print_error()`/`exit()` (a hard process exit, not a catchable error) if
+`$mysoc->country_id`/`country_code` aren't set — and the shared test DB had no
+`MAIN_INFO_SOCIETE_COUNTRY` const configured at all, since no prior phase's fixtures needed
+`$mysoc`'s country. Set permanently via `dolibarr_set_const($db, 'MAIN_INFO_SOCIETE_COUNTRY',
+'1:FR:France', 'chaine', 0, '', $conf->entity)` (rowid `1` = FR in this test DB's `c_country`) —
+a one-time, durable environment fix in the same spirit as enabling missing modules in prior
+sessions, not a per-script workaround. Also note for future fixtures in this codebase: a freshly
+`create()`d `AccountingAccount` defaults to `active = 0` unless explicitly set — several existing
+model methods (including `updateAccAcc()`, `getCptsCat()`) filter on `active = 1`, so any fixture
+account meant to participate in category/journal logic must set `->active = 1` before `create()`.
+
+## Phases 7, 9-11 — Remaining API_GAPS.md items — Open, scoped not implemented
+
+Each of these was deliberately left out of Phases 6 and 8 for a concrete reason (risk, an
+unresolved signature mismatch, unconfirmed correctness, or no precedent to build on in this
+codebase) — see `roadmap/API_GAPS.md` for the original gap analysis this backlog is closing out.
 
 **Phase 7 — Activate a chart of accounts (step 3, "select" half).** `POST
 accountingsystems/{id}/activate`, replicating `htdocs/accountancy/admin/account.php:170-219`'s
@@ -703,19 +792,8 @@ when implementing this); and `run_sql()`'s error handling tolerates reruns via i
 `$okerror='default'` whitelist but isn't truly idempotent (partial reruns could leave mixed
 state). Needs a dry-run/confirmation parameter before it's safe to expose unattended.
 
-**Phase 8 — Accounting account categories CRUD + assignment.** `AccountancyCategory`
-(`htdocs/accountancy/class/accountancycategory.class.php`) already has full
-`create`/`fetch`/`update`/`delete`; the category↔account relationship is a direct FK
-(`accounting_account.fk_accounting_category`), not a join table, managed via
-`updateAccAcc($id_cat, $cpts)` (bulk-assign, keyed by formatted account_number) and
-`deleteCptCat($cpt_id)` (unassign one, keyed by account rowid) — the wrapper needs to resolve an
-account's formatted number before calling `updateAccAcc()` since the two methods key differently.
-Build a new `api_accountingcategories.class.php` (`AccountingAccountCategories` or similar)
-mirroring the CRUD pattern already established in `api_accountingaccounts.class.php` (this fork's
-own prior work: `$FIELDS`/`$SETTABLE_FIELDS`, `hasRight('accounting','chartofaccount')`,
-`_checkValForField()` for non-numeric `fk_*` fields per [[project-accountancy-api-gotchas]] item
-1), plus `POST/DELETE {id}/accounts/{account_id}` modeled on
-`htdocs/categories/class/api_categories.class.php`'s link/unlink shape.
+**Phase 8 — Accounting account categories CRUD + assignment — see the "Phase 8" section above,
+now Implemented.**
 
 **Phase 9 — Ledger-transfer preview amounts (step C enhancement).** `AccountingJournals::pendingData()`
 (`api_accountingjournals.class.php:353-433`) currently returns only `ref`/`has_error` per pending
@@ -757,12 +835,14 @@ file under the admin temp dir (mirroring the wizard's own upload step), and driv
 generic `Import` class (`htdocs/imports/class/import.class.php`) reusing the `Chartofaccounts`
 profile rather than reimplementing column mapping/validation.
 
-## Critical files (Phases 1-6)
+## Critical files (Phases 1-6, 8)
 
 - `htdocs/accountancy/class/bookkeeping.class.php`
 - `htdocs/accountancy/class/lettering.class.php`
 - `htdocs/accountancy/class/accountingjournal.class.php`
 - `htdocs/accountancy/class/accountancysystem.class.php`
+- `htdocs/accountancy/class/accountancycategory.class.php` (bug fix in `create()` in Phase 8)
+- `htdocs/accountancy/class/api_accountingcategories.class.php` (new in Phase 8)
 - `htdocs/accountancy/journal/{sellsjournal,purchasesjournal,bankjournal,treasuryjournal,expensereportsjournal,variousjournal}.php`
 - `htdocs/accountancy/customer/{list,card}.php`, `htdocs/accountancy/supplier/{list,card}.php`
 - `htdocs/accountancy/closure/index.php`
