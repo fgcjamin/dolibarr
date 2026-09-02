@@ -784,6 +784,65 @@ class AccountingSetup extends DolibarrApi
 
 
 	/**
+	 * Get the list of VAT rates (dictionary entries) with their accounting-code fields.
+	 * Companion GET for putVatRateAccountingCodes() below, mirroring the
+	 * getChargesocialesAccountingCodes()/putChargesocialesAccountingCode() pair further down -
+	 * without this, discovering a VAT rate's id (needed by the PUT) requires going through the
+	 * unrelated generic GET dictionary/vat endpoint (api_setup.class.php).
+	 *
+	 * @param	int	$active		Filter on active status, -1 for all
+	 * @param	int	$fk_country	Country of the VAT rate, -1 = current company's country (default), 0 = all
+	 * @return array<int,array{id:int,code:string,taux:float,label:string,accountancy_code_sell:string,accountancy_code_buy:string}>
+	 *
+	 * @url GET vatrates/accountingcodes
+	 *
+	 * @throws RestException
+	 */
+	public function getVatRatesAccountingCodes($active = 1, $fk_country = -1)
+	{
+		global $mysoc;
+
+		if (!DolibarrApiAccess::$user->hasRight('accounting', 'chartofaccount')) {
+			throw new RestException(403);
+		}
+
+		$list = array();
+
+		$sql = "SELECT rowid, code, taux, note, fk_pays, accountancy_code_sell, accountancy_code_buy";
+		$sql .= " FROM ".MAIN_DB_PREFIX."c_tva";
+		$sql .= " WHERE 1 = 1";
+		if ($active != -1) {
+			$sql .= " AND active = ".((int) $active);
+		}
+		if ($fk_country == -1) {
+			$sql .= " AND fk_pays = ".((int) $mysoc->country_id);
+		} elseif ($fk_country > 0) {
+			$sql .= " AND fk_pays = ".((int) $fk_country);
+		}
+		$sql .= " ORDER BY taux";
+
+		$result = $this->db->query($sql);
+		if (!$result) {
+			throw new RestException(503, 'Error when retrieving list of vat rates: '.$this->db->lasterror());
+		}
+
+		$num = $this->db->num_rows($result);
+		for ($i = 0; $i < $num; $i++) {
+			$obj = $this->db->fetch_object($result);
+			$list[] = array(
+				'id' => (int) $obj->rowid,
+				'code' => (string) $obj->code,
+				'taux' => (float) $obj->taux,
+				'label' => (string) $obj->note,
+				'accountancy_code_sell' => (string) $obj->accountancy_code_sell,
+				'accountancy_code_buy' => (string) $obj->accountancy_code_buy,
+			);
+		}
+
+		return $list;
+	}
+
+	/**
 	 * Set the accounting-code fields of a VAT rate (dictionary entry).
 	 * Only accountancy_code_sell and accountancy_code_buy are touched; the
 	 * rate/label/country of the VAT dictionary entry are managed by the

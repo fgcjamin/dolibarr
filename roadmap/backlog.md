@@ -1,4 +1,4 @@
-# Accountancy Module REST API — Backlog (Phases 1-11)
+# Accountancy Module REST API — Backlog (Phases 1-13)
 
 ## Status summary
 
@@ -8,7 +8,11 @@ install can be driven through the accountancy module end to end via the API alon
 required. Phases 6-11 are a follow-up backlog written after auditing what's still missing beyond
 that core workflow (see `roadmap/API_GAPS.md` for the source analysis) — Phases 6, 7, 8, 9, and 11
 are implemented; Phase 10 (blocked pending research) turned out, once that research was done, not
-to be a real gap at all — see its section below.
+to be a real gap at all — see its section below. Phase 12 is a second follow-up, sourced from
+`roadmap/API_GAPS_2.md` (real usage feedback from an agent driving this API through the
+`dolibarr-accountancy` MCP server) — implemented. Phase 13, sourced from the same feedback, is a
+confirmed-but-not-yet-started backlog entry (bank-transaction-line gaps, in stock upstream files
+rather than this fork's own accounting-API additions).
 
 | Phase | Scope | Status | Key files |
 |---|---|---|---|
@@ -24,6 +28,8 @@ to be a real gap at all — see its section below.
 | 9 | Ledger-transfer preview amounts (step C enhancement) | Done | `accountingjournal.class.php` (`getPreviewAmountsForSells()`/`getPreviewAmountsForPurchases()`), `api_accountingjournals.class.php` (`pendingData()`) |
 | 10 | Product accountancy codes under `MAIN_PRODUCT_PERENTITY_SHARED` | Closed — not a real gap, see below | `product.class.php`, `api_products.class.php`, `test/phpunit/ProductTest.php` |
 | 11 | Chart-of-accounts CSV import | Done | new `api_accountingimport.class.php` |
+| 12 | Manual/free "OD" ledger entry creation + VAT-rate accounting-code listing | Done | `api_accountancy.class.php` (`POST ledger`), `api_accountingsetup.class.php` (`GET vatrates/accountingcodes`) |
+| 13 | Bank-transaction-line `accountancycode` update + `list_lines` pagination | Not started | `htdocs/compta/bank/class/account.class.php`, `htdocs/compta/bank/class/api_bankaccounts.class.php` |
 
 **One non-blocking follow-up, not a functional gap**: `test/phpunit/AccountingBindTest.php`
 (Phase 2) exercises `AccountingAccount::bindInvoiceLine()`/`unbindInvoiceLine()` directly, not the
@@ -1052,7 +1058,88 @@ notice-level "undefined array key" under strict error reporting on every call, n
 introduced by or worth fixing in this phase (same class of "existing quirk, preserved not fixed"
 documented for other journals' pre-existing behavior throughout this backlog).
 
-## Critical files (Phases 1-9, 11)
+Phase 12 (Manual/free "OD" ledger entry creation + VAT-rate accounting-code listing) has been
+implemented. Sourced from `roadmap/API_GAPS_2.md` items #1 and #5 (real usage feedback from an
+agent driving this API through the `dolibarr-accountancy` MCP server, not from `API_GAPS.md`'s
+original spec-audit).
+
+**#1**: the UI (`accountancy/bookkeeping/card.php`, `action=="add"`/`action=="confirm_create"`)
+already builds a multi-line balanced "OD" (opérations diverses) piece by calling
+`BookKeeping::createStd()` once per line, all sharing one `piece_num`
+(`BookKeeping::getNextNumMvt()`) — that was never exposed via the API, so entering an opening
+balance or a year-end adjustment entry required going through the UI. New `postLedgerEntry()`,
+`@url POST ledger`, in `api_accountancy.class.php`: takes `code_journal`, `doc_date`, `doc_ref`,
+optional `doc_type`/`ref`, and a `lines` array (`numero_compte`, `subledger_account`,
+`subledger_label`, `label_compte`, `label_operation`, `debit`, `credit` — the same field set as
+`PUT ledger/{id}`'s `$LEDGER_SETTABLE_FIELDS`). Validates each line the same way the UI's
+`action=="add"` handler does (`numero_compte` mandatory, not both debit and credit on one line,
+`checkGeneralAccountAllowsAuxiliary()` for subledger accounts), plus the balance check the
+feedback explicitly asked for (`sum(debit) === sum(credit)` across the whole piece, 400 if not).
+All lines are inserted inside one `$db->begin()`/`commit()`/`rollback()` wrapping the per-line
+`createStd()` calls (safe under Dolibarr's nested-transaction-depth tracking, same pattern already
+relied on by this backlog's fixture setup, see [[project-accountancy-api-gotchas]] item 10).
+Returns the created piece's lines (reusing `BookKeeping::fetchAll()` filtered by `piece_num`, same
+shape as `getLedger()`'s own response).
+
+**#5**: `PUT vatrates/{id}/accountingcodes` (`api_accountingsetup.class.php`) already existed —
+it's the MCP's `put_vat_rate` — and `chargesociales` already had a matching GET+PUT pair
+(`getChargesocialesAccountingCodes`/`putChargesocialesAccountingCode`), but VAT rates were missing
+the GET half on that same surface, forcing a detour through the unrelated generic `GET
+dictionary/vat` (`api_setup.class.php`) to discover `llx_c_tva.rowid` values needed by the PUT.
+New `getVatRatesAccountingCodes($active = 1, $fk_country = -1)`, `@url GET
+vatrates/accountingcodes`, mirroring `getChargesocialesAccountingCodes`'s response shape and `GET
+dictionary/vat`'s country-filter convention (`fk_country == -1` → current company's country via
+global `$mysoc`, `0` → all countries).
+
+**API**: both endpoints gated the same way their siblings already are —
+`accounting`/`mouvements`/`creer` for `POST ledger` (matches `PUT`/`DELETE ledger/{id}`),
+`accounting`/`chartofaccount` for `GET vatrates/accountingcodes` (matches
+`putVatRateAccountingCodes`/the chargesociales pair).
+
+**Verification**: `php -l` and `phpstan` (level 10, `bootstrap_action.php` bootstrap) both pass
+clean on both modified files — the only phpstan findings present are 3 pre-existing ones outside
+the new code (confirmed via `git stash`/re-run diff), no new baseline suppressions. New phpunit
+coverage added to `test/phpunit/AccountingLedgerApiTest.php`
+(`testPostLedgerCreatesBalancedEntry()`, `testPostLedgerRejectsUnbalancedOrInvalidEntry()`) and a
+new `test/phpunit/AccountingSetupApiTest.php`
+(`testGetVatRatesAccountingCodes()`/`testGetVatRatesAccountingCodesRequiresPermission()`) —
+written but, like every other `*ApiTest.php` file in this family, not runnable through the scratch
+`phpunit.phar` in this environment (confirmed pre-existing via `git stash`, same class of
+autoloader-collision tooling fragility as [[project-accountancy-api-gotchas]] item 5, not
+introduced by this phase). Verified instead via a direct-instantiation live smoke test against the
+real local test DB (all 14 checks passed, wrapped in `$db->begin()`/`rollback()`, zero residual
+rows): balanced 2-line entry created and confirmed via `GET ledger?piece_num=`, unbalanced/
+unknown-journal/both-debit-and-credit-on-a-line all correctly rejected (400/400/404), and
+`GET vatrates/accountingcodes` round-tripped codes set via the existing `PUT
+vatrates/{id}/accountingcodes` and correctly filtered by country.
+
+Phase 13 (Bank-transaction-line `accountancycode` update + `list_lines` pagination) — **not
+started**, confirmed-real backlog entry sourced from `roadmap/API_GAPS_2.md` items #2 and #3.
+Unlike every other phase in this backlog, both gaps are in **stock upstream Dolibarr files**, not
+this fork's own accounting-API additions — `htdocs/compta/bank/class/account.class.php` and
+`htdocs/compta/bank/class/api_bankaccounts.class.php` — so this phase has a different risk profile
+(touching shared core bank code, wider blast radius) and was deliberately deferred rather than
+bundled into Phase 12.
+
+- **#2**: `AccountLine` (`account.class.php`) has no `updateAccountancyCode()`-style method at
+  all — not just unexposed via the API. `addLine()` (`api_bankaccounts.class.php:527`, `@url POST
+  {id}/lines`) already accepts and stores `accountancycode` (as `numero_compte`) at creation, but
+  `updateLine()` (line 680, `@url PUT {id}/lines/{line_id}`) only accepts/updates `label`, calling
+  `AccountLine::updateLabel()`. Needs a new model method (`AccountLine::updateAccountancyCode()`
+  or similar, updating the `numero_compte` column) plus wiring it into `updateLine()` (either as a
+  new accepted field on the existing endpoint, or as a new dedicated endpoint — worth deciding at
+  implementation time whether extending the existing `PUT .../lines/{line_id}` to accept an
+  optional `accountancycode` alongside `label` is preferable to a separate endpoint).
+- **#3**: `getLines($id, $sqlfilters = '')` (`api_bankaccounts.class.php:461`, backing
+  `list_lines`) takes no `limit`/`page`/`offset` parameter, builds no `LIMIT`/`OFFSET` clause, and
+  fetches every matching row unconditionally — a commented-out, dead `//$min = min($num, ($limit
+  <= 0 ? $num : $limit));` at line 493 suggests pagination was half-implemented once and never
+  finished. Needs `limit`/`page` params added to the method signature and threaded into the SQL
+  (e.g. via `$this->db->plimit()`, the pattern already used in
+  `api_accountancy.class.php`/`api_setup.class.php`'s list endpoints), matching how every other
+  list endpoint in this codebase already behaves.
+
+## Critical files (Phases 1-9, 11-12)
 
 - `htdocs/accountancy/class/bookkeeping.class.php`
 - `htdocs/accountancy/class/lettering.class.php`
@@ -1077,3 +1164,8 @@ documented for other journals' pre-existing behavior throughout this backlog).
   as-is by Phase 11's headless driver
 - `htdocs/imports/import.php` (reference only — Phase 11's driver sequence mirrors its step 5/6
   action blocks but does not modify this file)
+- `htdocs/accountancy/class/api_accountancy.class.php` (`postLedgerEntry()` added in Phase 12)
+- `htdocs/accountancy/class/api_accountingsetup.class.php` (`getVatRatesAccountingCodes()` added
+  in Phase 12)
+- `test/phpunit/AccountingLedgerApiTest.php` (extended in Phase 12),
+  `test/phpunit/AccountingSetupApiTest.php` (new in Phase 12)

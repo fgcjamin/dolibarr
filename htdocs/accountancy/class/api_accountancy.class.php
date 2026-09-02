@@ -67,7 +67,9 @@ class Accountancy extends DolibarrApi
 		require_once DOL_DOCUMENT_ROOT.'/accountancy/class/bookkeeping.class.php';
 		require_once DOL_DOCUMENT_ROOT.'/accountancy/class/lettering.class.php';
 		require_once DOL_DOCUMENT_ROOT.'/accountancy/class/accountancyexport.class.php';
+		require_once DOL_DOCUMENT_ROOT.'/accountancy/class/accountingjournal.class.php';
 		require_once DOL_DOCUMENT_ROOT.'/core/class/fiscalyear.class.php';
+		require_once DOL_DOCUMENT_ROOT.'/core/lib/accounting.lib.php';
 
 		$langs->load('accountancy');
 
@@ -580,6 +582,171 @@ class Accountancy extends DolibarrApi
 				'message' => 'Ledger entry deleted'
 			)
 		);
+	}
+
+	/**
+	 * Create a manual/free ledger entry ("OD" - operations diverses): a balanced multi-line
+	 * piece not tied to any existing invoice/bank line, the same thing the UI's
+	 * accountancy/bookkeeping/card.php "add movement" form does (confirm_create + repeated add,
+	 * both via BookKeeping::createStd()), but as a single atomic call.
+	 *
+	 * @param   array   $request_data   Request data: code_journal, doc_date (YYYY-MM-DD), doc_ref,
+	 *                                  optional doc_type/ref, and lines (array of
+	 *                                  numero_compte/subledger_account/subledger_label/
+	 *                                  label_compte/label_operation/debit/credit)
+	 * @phan-param ?array<string,mixed> $request_data
+	 * @phpstan-param ?array<string,mixed> $request_data
+	 * @return  array
+	 * @phan-return array<int,BookKeepingLine>
+	 * @phpstan-return array<int,BookKeepingLine>
+	 *
+	 * @url     POST ledger
+	 *
+	 * @throws  RestException  400  Bad parameters, unbalanced entry, or invalid line
+	 * @throws  RestException  403  Insufficient rights
+	 * @throws  RestException  404  Journal not found
+	 * @throws  RestException  500  Error while creating ledger entry
+	 */
+	public function postLedgerEntry($request_data = null)
+	{
+		if (!DolibarrApiAccess::$user->hasRight('accounting', 'mouvements', 'creer')) {
+			throw new RestException(403, 'No permission to write ledger entries');
+		}
+
+		if (!is_array($request_data)) {
+			$request_data = array();
+		}
+
+		$code_journal = isset($request_data['code_journal']) ? trim((string) $request_data['code_journal']) : '';
+		$doc_date = isset($request_data['doc_date']) ? trim((string) $request_data['doc_date']) : '';
+		$doc_ref = isset($request_data['doc_ref']) ? trim((string) $request_data['doc_ref']) : '';
+		$doc_type = isset($request_data['doc_type']) ? trim((string) $request_data['doc_type']) : '';
+		$ref = isset($request_data['ref']) ? trim((string) $request_data['ref']) : '';
+		$lines = isset($request_data['lines']) && is_array($request_data['lines']) ? $request_data['lines'] : array();
+
+		if ($code_journal === '') {
+			throw new RestException(400, 'code_journal is mandatory');
+		}
+		if ($doc_date === '' || strtotime($doc_date) === false) {
+			throw new RestException(400, 'doc_date is mandatory and must be a valid date (YYYY-MM-DD)');
+		}
+		if ($doc_ref === '') {
+			throw new RestException(400, 'doc_ref is mandatory');
+		}
+		if (empty($lines)) {
+			throw new RestException(400, 'lines must be a non-empty array');
+		}
+
+		$journal = new AccountingJournal($this->db);
+		if ($journal->fetch(0, $code_journal) <= 0) {
+			throw new RestException(404, 'Journal not found: '.$code_journal);
+		}
+
+		$total_debit = 0.0;
+		$total_credit = 0.0;
+		$cleaned_lines = array();
+		foreach ($lines as $i => $line) {
+			if (!is_array($line)) {
+				throw new RestException(400, 'lines['.$i.'] must be an object');
+			}
+
+			$numero_compte = isset($line['numero_compte']) ? trim((string) $line['numero_compte']) : '';
+			$subledger_account = isset($line['subledger_account']) ? trim((string) $line['subledger_account']) : '';
+			$debit = isset($line['debit']) ? (float) price2num($line['debit'], 'MT') : 0.0;
+			$credit = isset($line['credit']) ? (float) price2num($line['credit'], 'MT') : 0.0;
+
+			if ($numero_compte === '') {
+				throw new RestException(400, 'lines['.$i.'].numero_compte is mandatory');
+			}
+			if ($debit != 0.0 && $credit != 0.0) {
+				throw new RestException(400, 'lines['.$i.']: a line cannot have both debit and credit set');
+			}
+			if ($debit == 0.0 && $credit == 0.0) {
+				throw new RestException(400, 'lines['.$i.']: either debit or credit must be non-zero');
+			}
+			if (!checkGeneralAccountAllowsAuxiliary($this->db, $numero_compte, $subledger_account)) {
+				throw new RestException(400, 'lines['.$i.']: account '.$numero_compte.' does not allow a subledger (auxiliary) account');
+			}
+
+			$total_debit += $debit;
+			$total_credit += $credit;
+			$cleaned_lines[] = array(
+				'numero_compte' => $numero_compte,
+				'subledger_account' => $subledger_account,
+				'subledger_label' => isset($line['subledger_label']) ? trim((string) $line['subledger_label']) : '',
+				'label_compte' => isset($line['label_compte']) ? trim((string) $line['label_compte']) : '',
+				'label_operation' => isset($line['label_operation']) ? trim((string) $line['label_operation']) : '',
+				'debit' => $debit,
+				'credit' => $credit,
+			);
+		}
+
+		if (round($total_debit - $total_credit, 5) != 0.0) {
+			throw new RestException(400, 'Entry is not balanced: total debit '.$total_debit.' != total credit '.$total_credit);
+		}
+
+		$piece_num = $this->bookkeeping->getNextNumMvt();
+		if ($piece_num < 0) {
+			throw new RestException(500, 'Error while computing next movement number: '.$this->bookkeeping->error);
+		}
+
+		if ($ref === '') {
+			$ref = $this->bookkeeping->getNextNumRef();
+		}
+		$datedoc = strtotime($doc_date);
+
+		$this->db->begin();
+
+		foreach ($cleaned_lines as $cleaned_line) {
+			$entryline = new BookKeeping($this->db);
+			$entryline->doc_date = $datedoc;
+			$entryline->doc_type = $doc_type;
+			$entryline->doc_ref = $doc_ref;
+			$entryline->fk_doc = 0;
+			$entryline->fk_docdet = 0;
+			$entryline->code_journal = $journal->code;
+			$entryline->journal_label = $journal->label;
+			$entryline->piece_num = $piece_num;
+			$entryline->ref = $ref;
+			$entryline->numero_compte = $cleaned_line['numero_compte'];
+			$entryline->subledger_account = $cleaned_line['subledger_account'];
+			$entryline->subledger_label = $cleaned_line['subledger_label'];
+			$entryline->label_compte = $cleaned_line['label_compte'];
+			$entryline->label_operation = $cleaned_line['label_operation'];
+			$entryline->debit = $cleaned_line['debit'];
+			$entryline->credit = $cleaned_line['credit'];
+			if ($cleaned_line['debit'] != 0.0) {
+				$entryline->montant = $cleaned_line['debit'];
+				$entryline->amount = $cleaned_line['debit'];
+				$entryline->sens = 'D';
+			} else {
+				$entryline->montant = $cleaned_line['credit'];
+				$entryline->amount = $cleaned_line['credit'];
+				$entryline->sens = 'C';
+			}
+
+			$result = $entryline->createStd(DolibarrApiAccess::$user);
+			if ($result < 0) {
+				$this->db->rollback();
+				throw new RestException(500, 'Error while creating ledger entry line: '.$entryline->errorsToString());
+			}
+		}
+
+		$this->db->commit();
+
+		$result = $this->bookkeeping->fetchAll('ASC', 't.rowid', 0, 0, array('t.piece_num' => $piece_num), 'AND', 1);
+		if ($result < 0) {
+			throw new RestException(503, 'Error while fetching created ledger entry: '.$this->bookkeeping->errorsToString());
+		}
+
+		$obj_ret = array();
+		if (is_array($this->bookkeeping->lines)) {
+			foreach ($this->bookkeeping->lines as $line) {
+				$obj_ret[] = $this->_cleanObjectDatas($line);
+			}
+		}
+
+		return $obj_ret;
 	}
 
 	/**

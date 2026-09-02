@@ -193,6 +193,108 @@ class AccountingLedgerApiTest extends CommonClassTest
 	}
 
 	/**
+	 * POST ledger creates a balanced multi-line manual ("OD") entry sharing one piece_num.
+	 *
+	 * @return void
+	 */
+	public function testPostLedgerCreatesBalancedEntry()
+	{
+		global $conf,$user,$langs,$db;
+		$conf = $this->savconf;
+		$user = $this->savuser;
+		$langs = $this->savlangs;
+		$db = $this->savdb;
+
+		DolibarrApiAccess::$user = $user;
+
+		$api = new Accountancy();
+
+		$year = 2905;
+		$this->createFiscalPeriod($year);
+
+		$result = $api->postLedgerEntry(array(
+			'code_journal' => 'OD',
+			'doc_date' => $year.'-06-15',
+			'doc_ref' => 'LEDGERAPITEST-POST',
+			'lines' => array(
+				array('numero_compte' => '411999', 'label_operation' => 'Debit line', 'debit' => 150.0),
+				array('numero_compte' => '706999', 'label_operation' => 'Credit line', 'credit' => 150.0),
+			),
+		));
+
+		$this->assertCount(2, $result);
+		$this->assertSame($result[0]->piece_num, $result[1]->piece_num);
+		foreach ($result as $line) {
+			$this->assertSame('LEDGERAPITEST-POST', $line->doc_ref);
+			$this->assertSame('OD', $line->code_journal);
+		}
+		$total_debit = (float) $result[0]->debit + (float) $result[1]->debit;
+		$total_credit = (float) $result[0]->credit + (float) $result[1]->credit;
+		$this->assertSame(150.0, $total_debit);
+		$this->assertSame(150.0, $total_credit);
+	}
+
+	/**
+	 * POST ledger rejects an unbalanced entry, a line missing numero_compte, a line with both
+	 * debit and credit set, and an unknown journal code.
+	 *
+	 * @return void
+	 */
+	public function testPostLedgerRejectsUnbalancedOrInvalidEntry()
+	{
+		global $conf,$user,$langs,$db;
+		$conf = $this->savconf;
+		$user = $this->savuser;
+		$langs = $this->savlangs;
+		$db = $this->savdb;
+
+		DolibarrApiAccess::$user = $user;
+
+		$api = new Accountancy();
+
+		$year = 2906;
+		$this->createFiscalPeriod($year);
+
+		$base = array(
+			'code_journal' => 'OD',
+			'doc_date' => $year.'-06-15',
+			'doc_ref' => 'LEDGERAPITEST-POST-INVALID',
+		);
+
+		$cases = array(
+			'unbalanced' => array(400, array_merge($base, array('lines' => array(
+				array('numero_compte' => '411999', 'debit' => 100.0),
+				array('numero_compte' => '706999', 'credit' => 50.0),
+			)))),
+			'missing numero_compte' => array(400, array_merge($base, array('lines' => array(
+				array('numero_compte' => '', 'debit' => 100.0),
+				array('numero_compte' => '706999', 'credit' => 100.0),
+			)))),
+			'both debit and credit on one line' => array(400, array_merge($base, array('lines' => array(
+				array('numero_compte' => '411999', 'debit' => 100.0, 'credit' => 100.0),
+				array('numero_compte' => '706999', 'credit' => 100.0),
+			)))),
+			'empty lines' => array(400, array_merge($base, array('lines' => array()))),
+			'unknown journal' => array(404, array_merge($base, array('code_journal' => 'NOTAJOURNAL', 'lines' => array(
+				array('numero_compte' => '411999', 'debit' => 100.0),
+				array('numero_compte' => '706999', 'credit' => 100.0),
+			)))),
+		);
+
+		foreach ($cases as $label => $case) {
+			list($expected_code, $payload) = $case;
+			$rejected = false;
+			try {
+				$api->postLedgerEntry($payload);
+			} catch (RestException $e) {
+				$rejected = true;
+				$this->assertSame($expected_code, $e->getCode(), $label);
+			}
+			$this->assertTrue($rejected, 'postLedgerEntry must reject case: '.$label);
+		}
+	}
+
+	/**
 	 * getLedgerEntry() on an unknown id must return a 404.
 	 *
 	 * @return void
