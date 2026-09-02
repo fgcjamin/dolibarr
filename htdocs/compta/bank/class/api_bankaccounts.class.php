@@ -449,6 +449,9 @@ class BankAccounts extends DolibarrApi
 	 * Get the list of lines of the account.
 	 *
 	 * @param int $id ID of account
+	 * @param string    $sqlfilters Other criteria to filter answers separated by a comma. Syntax example "(t.ref:like:'SO-%') and (t.import_key:<:'20160101')"
+	 * @param int    $limit    Limit for list. 0 to disable pagination and get all lines.
+	 * @param int    $page     Page number
 	 * @return array Array of AccountLine objects
 	 * @phan-return AccountLine[]
 	 * @phpstan-return AccountLine[]
@@ -456,9 +459,8 @@ class BankAccounts extends DolibarrApi
 	 * @throws RestException
 	 *
 	 * @url GET {id}/lines
-	 * @param string    $sqlfilters Other criteria to filter answers separated by a comma. Syntax example "(t.ref:like:'SO-%') and (t.import_key:<:'20160101')"
 	 */
-	public function getLines($id, $sqlfilters = '')
+	public function getLines($id, $sqlfilters = '', $limit = 0, $page = 0)
 	{
 		$list = array();
 
@@ -486,12 +488,21 @@ class BankAccounts extends DolibarrApi
 
 		$sql .= " ORDER BY rowid";
 
+		if ($limit) {
+			if ($page < 0) {
+				$page = 0;
+			}
+			$offset = $limit * $page;
+
+			$sql .= $this->db->plimit($limit + 1, $offset);
+		}
+
 		$result = $this->db->query($sql);
 
 		if ($result) {
 			$num = $this->db->num_rows($result);
-			//$min = min($num, ($limit <= 0 ? $num : $limit));
-			for ($i = 0; $i < $num; $i++) {
+			$min = min($num, ($limit <= 0 ? $num : $limit));
+			for ($i = 0; $i < $min; $i++) {
 				$obj = $this->db->fetch_object($result);
 				$accountLine = new AccountLine($this->db);
 				if ($accountLine->fetch($obj->rowid) > 0) {
@@ -670,14 +681,15 @@ class BankAccounts extends DolibarrApi
 	/**
 	 * Update an account line
 	 *
-	 * @param int    $id    		ID of account
-	 * @param int    $line_id       ID of account line
-	 * @param string $label         Label {@from body}
+	 * @param int    $id                ID of account
+	 * @param int    $line_id           ID of account line
+	 * @param string $label             Label {@from body}
+	 * @param string $accountancycode   Accountancy code. Leave empty to keep it unchanged. {@from body}
 	 * @return int  ID of link
 	 *
 	 * @url PUT {id}/lines/{line_id}
 	 */
-	public function updateLine($id, $line_id, $label)
+	public function updateLine($id, $line_id, $label, $accountancycode = '')
 	{
 		if (!DolibarrApiAccess::$user->rights->banque->modifier) {
 			throw new RestException(403);
@@ -705,6 +717,16 @@ class BankAccounts extends DolibarrApi
 		if ($result < 0) {
 			throw new RestException(503, 'Error when updating link to account line: ' . $accountLine->error);
 		}
+
+		if ($accountancycode !== '') {
+			$accountLine->numero_compte = sanitizeVal($accountancycode);
+
+			$result = $accountLine->updateAccountancyCode();
+			if ($result < 0) {
+				throw new RestException(503, 'Error when updating accountancy code of account line: ' . $accountLine->error);
+			}
+		}
+
 		return $accountLine->id;
 	}
 

@@ -2237,7 +2237,7 @@ class AccountLine extends CommonObjectLine
 		$sql = "SELECT b.rowid, b.datec, b.datev, b.dateo, b.amount, b.label as label, b.fk_account,";
 		$sql .= " b.fk_user_author, b.fk_user_rappro,";
 		$sql .= " b.fk_type, b.num_releve, b.num_chq, b.rappro, b.note,";
-		$sql .= " b.fk_bordereau, b.banque, b.emetteur,";
+		$sql .= " b.fk_bordereau, b.banque, b.emetteur, b.numero_compte,";
 		$sql .= " ba.ref as bank_account_ref, ba.label as bank_account_label";
 		$sql .= " FROM ".MAIN_DB_PREFIX."bank as b,";
 		$sql .= " ".MAIN_DB_PREFIX."bank_account as ba";
@@ -2279,6 +2279,7 @@ class AccountLine extends CommonObjectLine
 				$this->num_chq = $obj->num_chq;
 				$this->bank_chq = $obj->banque;
 				$this->fk_bordereau = $obj->fk_bordereau;
+				$this->numero_compte = $obj->numero_compte;
 
 				$this->fk_account = $obj->fk_account;
 				$this->bank_account_ref = $obj->bank_account_ref;
@@ -2532,6 +2533,32 @@ class AccountLine extends CommonObjectLine
 		$sql .= " WHERE rowid = ".((int) $this->rowid);
 
 		dol_syslog(get_class($this)."::update_label", LOG_DEBUG);
+		$resql = $this->db->query($sql);
+		if ($resql) {
+			$this->db->commit();
+			return 1;
+		} else {
+			$this->db->rollback();
+			$this->error = $this->db->error();
+			return -1;
+		}
+	}
+
+
+	/**
+	 *		Update bank account record accountancy code (numero_compte) in database
+	 *
+	 *		@return	int						Return integer <0 if KO, >0 if OK
+	 */
+	public function updateAccountancyCode()
+	{
+		$this->db->begin();
+
+		$sql = "UPDATE ".MAIN_DB_PREFIX."bank SET";
+		$sql .= " numero_compte = '".$this->db->escape($this->numero_compte)."'";
+		$sql .= " WHERE rowid = ".((int) $this->rowid);
+
+		dol_syslog(get_class($this)."::updateAccountancyCode", LOG_DEBUG);
 		$resql = $this->db->query($sql);
 		if ($resql) {
 			$this->db->commit();

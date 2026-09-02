@@ -10,9 +10,9 @@ that core workflow (see `roadmap/API_GAPS.md` for the source analysis) — Phase
 are implemented; Phase 10 (blocked pending research) turned out, once that research was done, not
 to be a real gap at all — see its section below. Phase 12 is a second follow-up, sourced from
 `roadmap/API_GAPS_2.md` (real usage feedback from an agent driving this API through the
-`dolibarr-accountancy` MCP server) — implemented. Phase 13, sourced from the same feedback, is a
-confirmed-but-not-yet-started backlog entry (bank-transaction-line gaps, in stock upstream files
-rather than this fork's own accounting-API additions).
+`dolibarr-accountancy` MCP server) — implemented. Phase 13, sourced from the same feedback
+(bank-transaction-line gaps, in stock upstream files rather than this fork's own accounting-API
+additions), is implemented.
 
 | Phase | Scope | Status | Key files |
 |---|---|---|---|
@@ -29,7 +29,7 @@ rather than this fork's own accounting-API additions).
 | 10 | Product accountancy codes under `MAIN_PRODUCT_PERENTITY_SHARED` | Closed — not a real gap, see below | `product.class.php`, `api_products.class.php`, `test/phpunit/ProductTest.php` |
 | 11 | Chart-of-accounts CSV import | Done | new `api_accountingimport.class.php` |
 | 12 | Manual/free "OD" ledger entry creation + VAT-rate accounting-code listing | Done | `api_accountancy.class.php` (`POST ledger`), `api_accountingsetup.class.php` (`GET vatrates/accountingcodes`) |
-| 13 | Bank-transaction-line `accountancycode` update + `list_lines` pagination | Not started | `htdocs/compta/bank/class/account.class.php`, `htdocs/compta/bank/class/api_bankaccounts.class.php` |
+| 13 | Bank-transaction-line `accountancycode` update + `list_lines` pagination | Done | `htdocs/compta/bank/class/account.class.php`, `htdocs/compta/bank/class/api_bankaccounts.class.php` |
 
 **One non-blocking follow-up, not a functional gap**: `test/phpunit/AccountingBindTest.php`
 (Phase 2) exercises `AccountingAccount::bindInvoiceLine()`/`unbindInvoiceLine()` directly, not the
@@ -1113,31 +1113,53 @@ unknown-journal/both-debit-and-credit-on-a-line all correctly rejected (400/400/
 `GET vatrates/accountingcodes` round-tripped codes set via the existing `PUT
 vatrates/{id}/accountingcodes` and correctly filtered by country.
 
-Phase 13 (Bank-transaction-line `accountancycode` update + `list_lines` pagination) — **not
-started**, confirmed-real backlog entry sourced from `roadmap/API_GAPS_2.md` items #2 and #3.
-Unlike every other phase in this backlog, both gaps are in **stock upstream Dolibarr files**, not
-this fork's own accounting-API additions — `htdocs/compta/bank/class/account.class.php` and
-`htdocs/compta/bank/class/api_bankaccounts.class.php` — so this phase has a different risk profile
-(touching shared core bank code, wider blast radius) and was deliberately deferred rather than
-bundled into Phase 12.
+Phase 13 (Bank-transaction-line `accountancycode` update + `list_lines` pagination) — **Implemented**,
+confirmed-real backlog entry sourced from `roadmap/API_GAPS_2.md` items #2 and #3. Unlike every
+other phase in this backlog, both gaps are in **stock upstream Dolibarr files**, not this fork's
+own accounting-API additions — `htdocs/compta/bank/class/account.class.php` and
+`htdocs/compta/bank/class/api_bankaccounts.class.php`.
 
-- **#2**: `AccountLine` (`account.class.php`) has no `updateAccountancyCode()`-style method at
-  all — not just unexposed via the API. `addLine()` (`api_bankaccounts.class.php:527`, `@url POST
-  {id}/lines`) already accepts and stores `accountancycode` (as `numero_compte`) at creation, but
-  `updateLine()` (line 680, `@url PUT {id}/lines/{line_id}`) only accepts/updates `label`, calling
-  `AccountLine::updateLabel()`. Needs a new model method (`AccountLine::updateAccountancyCode()`
-  or similar, updating the `numero_compte` column) plus wiring it into `updateLine()` (either as a
-  new accepted field on the existing endpoint, or as a new dedicated endpoint — worth deciding at
-  implementation time whether extending the existing `PUT .../lines/{line_id}` to accept an
-  optional `accountancycode` alongside `label` is preferable to a separate endpoint).
-- **#3**: `getLines($id, $sqlfilters = '')` (`api_bankaccounts.class.php:461`, backing
-  `list_lines`) takes no `limit`/`page`/`offset` parameter, builds no `LIMIT`/`OFFSET` clause, and
-  fetches every matching row unconditionally — a commented-out, dead `//$min = min($num, ($limit
-  <= 0 ? $num : $limit));` at line 493 suggests pagination was half-implemented once and never
-  finished. Needs `limit`/`page` params added to the method signature and threaded into the SQL
-  (e.g. via `$this->db->plimit()`, the pattern already used in
-  `api_accountancy.class.php`/`api_setup.class.php`'s list endpoints), matching how every other
-  list endpoint in this codebase already behaves.
+- **#2**: Added `AccountLine::updateAccountancyCode()` (`account.class.php`), a straight sibling
+  of the existing `updateLabel()` (same `begin()`/`UPDATE ... WHERE rowid`/`commit()`/`rollback()`
+  shape), writing the `numero_compte` column. Wired into the existing `PUT {id}/lines/{line_id}`
+  endpoint (`updateLine()`, `api_bankaccounts.class.php`) as a new optional `$accountancycode`
+  parameter alongside the pre-existing required `$label` — extending the endpoint rather than
+  adding a new one, per the decision flagged at scoping time. `''` (the default) means "leave
+  unchanged", matching `addLine()`'s own already-established convention for this same field —
+  there is no way to explicitly clear the code back to empty via this endpoint, same limitation
+  `addLine()` already has.
+  **Found and fixed one real, closely-related bug while verifying this**: `AccountLine::fetch()`
+  never selected/populated `numero_compte` at all — the column is written by `addLine()`/
+  `insert()` but a subsequent `fetch()` silently left the property at its uninitialized default.
+  This meant `accountancycode` could be set (via `addLine()`, and now `updateLine()`) but never
+  read back through the model or through any API endpoint (`getLines()`, `getDetailAccountLine()`)
+  that returns a freshly-`fetch()`ed `AccountLine` — a write-only, unverifiable field. Fixed by
+  adding `b.numero_compte` to `fetch()`'s `SELECT` and `$this->numero_compte = $obj->numero_compte;`
+  alongside its other column assignments — purely additive, the property already existed and was
+  simply never populated. Caught via the golden-baseline-style live smoke test against the local
+  test DB (direct-write-then-fetch-back round trip failed) before it was written up as a phpunit
+  test, not by static analysis.
+- **#3**: `getLines($id, $sqlfilters = '', $limit = 0, $page = 0)` (`api_bankaccounts.class.php`)
+  now builds a `LIMIT`/`OFFSET` clause via `$this->db->plimit($limit + 1, $offset)` when `$limit`
+  is set, and the fetch loop uses `min($num, ($limit <= 0 ? $num : $limit))` — replacing the dead,
+  commented-out line that had exactly this shape — matching the pattern already used by
+  `api_invoices.class.php` and every other paginated list endpoint in this codebase. `$limit = 0`
+  (the default) preserves the prior unconditional-fetch-all behavior, so this is backward
+  compatible for existing callers.
+
+**Verification**: `test/phpunit/BankAccountLineAccountancyCodeTest.php` (4 tests, 31 assertions,
+passes cleanly via phpunit — unlike the `*ApiTest.php` files in this family, this one instantiates
+`BankAccounts`/`AccountLine` directly rather than going through Restler's dispatch, so it doesn't
+hit the autoloader-collision fragility noted in [[project-accountancy-api-gotchas]]):
+`testFetchPopulatesAccountancyCode()` (the fetch() fix itself), `testUpdateAccountancyCodeModelMethod()`
+(the new model method, direct), `testApiUpdateLineAccountancyCode()` (the API endpoint, both the
+"code provided" and "code omitted, left unchanged" branches), `testApiGetLinesPagination()`
+(2-page split of a 4-line account — 3 fixture lines plus the "InitialBankBalance" line
+`Account::create()` itself adds — asserting no gap/overlap between pages and that the concatenated
+pages match the unpaginated call). Also re-ran the pre-existing `AccountingJournalBankTransferTest.php`,
+`AccountingJournalTreasuryTransferTest.php`, and `BankAccountTest.php` (all of which construct
+`Account`/`AccountLine` objects) against the `fetch()` change — all pass unchanged, confirming the
+new column in the `SELECT` is purely additive.
 
 ## Critical files (Phases 1-9, 11-12)
 
