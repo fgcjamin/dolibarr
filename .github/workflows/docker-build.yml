@@ -36,7 +36,7 @@ jobs:
             echo "::warning::git tag $BASE_TAG not found, skipping htdocs drift guard"
             exit 0
           fi
-          ALLOWED='^htdocs/accountancy/|^htdocs/api/class/api_setup\.class\.php$|^htdocs/core/class/fiscalyear\.class\.php$|^htdocs/core/lib/functions2\.lib\.php$'
+          ALLOWED='^htdocs/accountancy/|^htdocs/api/class/api_setup\.class\.php$|^htdocs/core/class/fiscalyear\.class\.php$|^htdocs/core/lib/functions2\.lib\.php$|^htdocs/compta/bank/class/account\.class\.php$|^htdocs/compta/bank/class/api_bankaccounts\.class\.php$'
           DRIFT=$(git diff --name-only "$BASE_TAG" HEAD -- htdocs | grep -vE "$ALLOWED" || true)
           if [ -n "$DRIFT" ]; then
             echo "::error::htdocs files changed outside docker/Dockerfile's COPY list:"

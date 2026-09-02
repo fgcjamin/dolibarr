@@ -14,3 +14,5 @@ COPY htdocs/accountancy/ /var/www/html/accountancy/
 COPY htdocs/api/class/api_setup.class.php /var/www/html/api/class/api_setup.class.php
 COPY htdocs/core/class/fiscalyear.class.php /var/www/html/core/class/fiscalyear.class.php
 COPY htdocs/core/lib/functions2.lib.php /var/www/html/core/lib/functions2.lib.php
+COPY htdocs/compta/bank/class/account.class.php /var/www/html/compta/bank/class/account.class.php
+COPY htdocs/compta/bank/class/api_bankaccounts.class.php /var/www/html/compta/bank/class/api_bankaccounts.class.php
