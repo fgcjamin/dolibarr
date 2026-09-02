@@ -296,9 +296,13 @@ class AccountingJournals extends DolibarrApi
 	 * @param	array	$request_data	Request data
 	 * @phan-param array{date_start?:int,date_end?:int} $request_data
 	 * @phpstan-param array{date_start?:int,date_end?:int} $request_data
+	 * `errors` carries, for each invoice/report that failed, its id, ref and the actual server
+	 * error message (natures 1/2/3/5 only - nature 4/bank-treasury has no per-line error map to
+	 * report from yet, see roadmap/backlog.md, so `errors` is always empty for that nature).
+	 *
 	 * @return	array
-	 * @phan-return array{success:bool,nb_errors:int}
-	 * @phpstan-return array{success:bool,nb_errors:int}
+	 * @phan-return array{success:bool,nb_errors:int,errors:array<array{id:int,ref:string,error:string}>}
+	 * @phpstan-return array{success:bool,nb_errors:int,errors:array<array{id:int,ref:string,error:string}>}
 	 *
 	 * @url		POST journals/{id}/transfer
 	 *
@@ -346,9 +350,19 @@ class AccountingJournals extends DolibarrApi
 			throw new RestException(400, 'Transfer via API is not yet implemented for this journal type (nature '.$journal->nature.'); see roadmap/backlog.md Phase 3b');
 		}
 
+		$errors = array();
+		foreach ($journal->errorforinvoicedetail as $invoiceid => $detail) {
+			$errors[] = array(
+				'id' => (int) $invoiceid,
+				'ref' => (string) $detail['ref'],
+				'error' => (string) $detail['error'],
+			);
+		}
+
 		return array(
 			'success' => $result >= 0,
 			'nb_errors' => $result < 0 ? abs($result) : 0,
+			'errors' => $errors,
 		);
 	}
 

@@ -297,6 +297,84 @@ class AccountingJournalSellsTransferTest extends CommonClassTest
 	}
 
 	/**
+	 * Regression test for the 2026-09-02 bug report: a transfer failure (here, a missing VAT
+	 * account causing BookKeeping::create()'s NOT NULL 'label_compte' insert to fail) must be
+	 * captured per-invoice in AccountingJournal::$errorforinvoicedetail, not just as an opaque
+	 * error count - this is what lets AccountingJournals::transfer() surface which invoice
+	 * failed and why, instead of an empty-looking `{"success": false, "nb_errors": 1}`.
+	 *
+	 * @return void
+	 */
+	public function testWriteIntoBookkeepingForSellsCapturesErrorDetail()
+	{
+		global $conf,$user,$langs,$db;
+		$conf = $this->savconf;
+		$user = $this->savuser;
+		$langs = $this->savlangs;
+		$db = $this->savdb;
+
+		$year = 2962;
+
+		$period = new Fiscalyear($db);
+		$period->label = 'AccountingJournalSellsTransferTest errordetail period '.$year;
+		$period->date_start = dol_mktime(0, 0, 0, 1, 1, $year);
+		$period->date_end = dol_mktime(23, 59, 59, 12, 31, $year);
+		$period_id = $period->create($user);
+		$this->assertGreaterThan(0, $period_id, $period->errorsToString());
+		unset($conf->cache['active_fiscal_period_cached']);
+
+		$sql = "SELECT rowid, pcg_version FROM ".MAIN_DB_PREFIX."accounting_system WHERE pcg_version = 'PCG25-DEV'";
+		$res = $db->query($sql);
+		$chart = $db->fetch_object($res);
+		$conf->global->CHARTOFACCOUNTS = (int) $chart->rowid;
+		$conf->global->ACCOUNTING_ACCOUNT_CUSTOMER = '411999';
+		// Deliberately point at a VAT account that is never seeded into accounting_account -
+		// reproduces the real-world "missing account in the chart of accounts" failure.
+		$conf->global->ACCOUNTING_VAT_SOLD_ACCOUNT = '445962';
+		$conf->global->ACCOUNTING_PRODUCT_SOLD_ACCOUNT = '707999';
+
+		$this->seedAccount($db, $chart->pcg_version, '411999', 'AccountingJournalSellsTransferTest customer control');
+		$acctProductId = $this->seedAccount($db, $chart->pcg_version, '707999', 'AccountingJournalSellsTransferTest product sales');
+
+		$dateLine = dol_mktime(12, 0, 0, 6, 15, $year);
+
+		$soc = new Societe($db);
+		$soc->name = 'AccountingJournalSellsTransferTest errordetail customer';
+		$soc->client = 1;
+		$soc->code_client = -1;
+		$socId = $soc->create($user);
+		$this->assertGreaterThan(0, $socId, (string) $soc->error);
+
+		$fac = new Facture($db);
+		$fac->socid = $socId;
+		$fac->date = $dateLine;
+		$fac->type = Facture::TYPE_STANDARD;
+		$facId = $fac->create($user);
+		$this->assertGreaterThan(0, $facId, (string) $fac->error);
+
+		$lineId = $fac->addline('AccountingJournalSellsTransferTest errordetail line', 100, 1, 20, 0, 0, 0, 0, '', '', $acctProductId);
+		$this->assertGreaterThan(0, $lineId, (string) $fac->error);
+
+		$valResult = $fac->validate($user);
+		$this->assertGreaterThanOrEqual(0, $valResult, (string) $fac->error);
+
+		$journal = new AccountingJournal($db);
+		$sql = "SELECT rowid FROM ".MAIN_DB_PREFIX."accounting_journal WHERE nature = 2 AND entity = ".((int) $conf->entity);
+		$res = $db->query($sql);
+		$obj = $db->fetch_object($res);
+		$journal->fetch((int) $obj->rowid);
+
+		$date_start = dol_mktime(0, 0, 0, 1, 1, $year);
+		$date_end = dol_mktime(23, 59, 59, 12, 31, $year);
+
+		$result = $journal->writeIntoBookkeepingForSells($user, $date_start, $date_end);
+		$this->assertLessThan(0, $result, 'Transfer must report an error when a target account is missing from the chart of accounts');
+		$this->assertArrayHasKey($facId, $journal->errorforinvoicedetail, 'The failing invoice must be captured in errorforinvoicedetail');
+		$this->assertSame($fac->ref, $journal->errorforinvoicedetail[$facId]['ref']);
+		$this->assertNotEmpty($journal->errorforinvoicedetail[$facId]['error'], 'The per-invoice error detail must carry the actual server error message, not be empty');
+	}
+
+	/**
 	 * A "replaced" invoice (close_code == Facture::CLOSECODE_REPLACED, not yet dispatched)
 	 * must be silently skipped by writeIntoBookkeepingForSells() - no bookkeeping rows, no
 	 * error counted.

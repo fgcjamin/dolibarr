@@ -76,6 +76,14 @@ class AccountingJournal extends CommonObject
 	public $active;
 
 	/**
+	 * @var array<int,array{ref:string,error:string}>	Per-invoice/report error detail from the last
+	 *      writeIntoBookkeeping()/writeIntoBookkeepingForXxx() call (natures 1/2/3/5 only - natures
+	 *      4/bank-treasury have no error-map to enrich, see roadmap/backlog.md). Keyed by the same
+	 *      invoice/report id used in the internal $errorforinvoice map. Reset at the start of each call.
+	 */
+	public $errorforinvoicedetail = array();
+
+	/**
 	 * @var array<string,array{found:bool,label:string,code_formatted_1:string,label_formatted_1:string,label_formatted_2:string}> 	Accounting account cached
 	 */
 	public static $accounting_account_cached = array();
@@ -1457,6 +1465,7 @@ class AccountingJournal extends CommonObject
 		require_once DOL_DOCUMENT_ROOT . '/accountancy/class/bookkeeping.class.php';
 
 		$error = 0;
+		$this->errorforinvoicedetail = array();
 
 		$hookmanager->initHooks(array('accountingjournaldao'));
 		$parameters = array('journal_data' => &$journal_data);
@@ -1482,6 +1491,10 @@ class AccountingJournal extends CommonObject
 					$error++;
 					$error_for_line++;
 					$this->errors[] = $langs->trans('ErrorInvoiceContainsLinesNotYetBounded', $element['ref']);
+					$this->errorforinvoicedetail[$element_id] = array(
+						'ref' => (string) $element['ref'],
+						'error' => $langs->trans('ErrorInvoiceContainsLinesNotYetBounded', $element['ref']),
+					);
 				}
 
 				if (!$error_for_line) {
@@ -1521,11 +1534,19 @@ class AccountingJournal extends CommonObject
 									$error++;
 									$error_for_line++;
 									$journal_data[$element_id]['error'] = 'alreadyjournalized';
+									$this->errorforinvoicedetail[$element_id] = array(
+										'ref' => (string) $element['ref'],
+										'error' => $langs->trans('BookkeepingRecordAlreadyExists'),
+									);
 								} else {
 									$error++;
 									$error_for_line++;
 									$journal_data[$element_id]['error'] = 'other';
 									$this->errors[] = $bookkeeping->errorsToString();
+									$this->errorforinvoicedetail[$element_id] = array(
+										'ref' => (string) $element['ref'],
+										'error' => $bookkeeping->errorsToString(),
+									);
 								}
 							}
 							//
@@ -1555,6 +1576,10 @@ class AccountingJournal extends CommonObject
 					$error_for_line++;
 					$journal_data[$element_id]['error'] = 'amountsnotbalanced';
 					$this->errors[] = 'Try to insert a non balanced transaction in book for ' . json_encode($element['blocks']) . '. Canceled. Surely a bug.';
+					$this->errorforinvoicedetail[$element_id] = array(
+						'ref' => (string) $element['ref'],
+						'error' => 'Try to insert a non balanced transaction in book for ' . (string) $element['ref'] . '. Canceled. Surely a bug.',
+					);
 				}
 
 				if (!$error_for_line) {
@@ -1785,6 +1810,7 @@ class AccountingJournal extends CommonObject
 
 		$now = dol_now();
 		$error = 0;
+		$this->errorforinvoicedetail = array();
 
 		$userstatic = new User($this->db);
 		$bookkeepingstatic = new BookKeeping($this->db);
@@ -1809,6 +1835,10 @@ class AccountingJournal extends CommonObject
 				$error++;
 				$errorforline++;
 				setEventMessages($langs->trans('ErrorInvoiceContainsLinesNotYetBounded', $val['ref']), null, 'errors');
+				$this->errorforinvoicedetail[$key] = array(
+					'ref' => (string) $val['ref'],
+					'error' => $langs->trans('ErrorInvoiceContainsLinesNotYetBounded', $val['ref']),
+				);
 			}
 
 			// Thirdparty
@@ -1848,11 +1878,19 @@ class AccountingJournal extends CommonObject
 								$error++;
 								$errorforline++;
 								$errorforinvoice[$key] = 'alreadyjournalized';
+								$this->errorforinvoicedetail[$key] = array(
+									'ref' => (string) $val['ref'],
+									'error' => $langs->trans('BookkeepingRecordAlreadyExists'),
+								);
 							} else {
 								$error++;
 								$errorforline++;
 								$errorforinvoice[$key] = 'other';
 								setEventMessages($bookkeeping->error, $bookkeeping->errors, 'errors');
+								$this->errorforinvoicedetail[$key] = array(
+									'ref' => (string) $val['ref'],
+									'error' => $bookkeeping->errorsToString(),
+								);
 							}
 						}
 					}
@@ -1909,11 +1947,19 @@ class AccountingJournal extends CommonObject
 									$error++;
 									$errorforline++;
 									$errorforinvoice[$key] = 'alreadyjournalized';
+									$this->errorforinvoicedetail[$key] = array(
+										'ref' => (string) $val['ref'],
+										'error' => $langs->trans('BookkeepingRecordAlreadyExists'),
+									);
 								} else {
 									$error++;
 									$errorforline++;
 									$errorforinvoice[$key] = 'other';
 									setEventMessages($bookkeeping->error, $bookkeeping->errors, 'errors');
+									$this->errorforinvoicedetail[$key] = array(
+										'ref' => (string) $val['ref'],
+										'error' => $bookkeeping->errorsToString(),
+									);
 								}
 							}
 						}
@@ -1983,11 +2029,19 @@ class AccountingJournal extends CommonObject
 									$error++;
 									$errorforline++;
 									$errorforinvoice[$key] = 'alreadyjournalized';
+									$this->errorforinvoicedetail[$key] = array(
+										'ref' => (string) $val['ref'],
+										'error' => $langs->trans('BookkeepingRecordAlreadyExists'),
+									);
 								} else {
 									$error++;
 									$errorforline++;
 									$errorforinvoice[$key] = 'other';
 									setEventMessages($bookkeeping->error, $bookkeeping->errors, 'errors');
+									$this->errorforinvoicedetail[$key] = array(
+										'ref' => (string) $val['ref'],
+										'error' => $bookkeeping->errorsToString(),
+									);
 								}
 							}
 						}
@@ -2001,6 +2055,10 @@ class AccountingJournal extends CommonObject
 				$errorforline++;
 				$errorforinvoice[$key] = 'amountsnotbalanced';
 				setEventMessages('We tried to insert a non balanced transaction in book for '.$val["ref"].'. Canceled. Surely a bug.', null, 'errors');
+				$this->errorforinvoicedetail[$key] = array(
+					'ref' => (string) $val['ref'],
+					'error' => 'Try to insert a non balanced transaction in book for '.(string) $val['ref'].'. Canceled. Surely a bug.',
+				);
 			}
 
 			if (!$errorforline) {
@@ -2499,6 +2557,7 @@ class AccountingJournal extends CommonObject
 
 		$now = dol_now();
 		$error = 0;
+		$this->errorforinvoicedetail = array();
 
 		$companystatic = new Societe($this->db);
 		$invoicestatic = new Facture($this->db);
@@ -2552,6 +2611,10 @@ class AccountingJournal extends CommonObject
 				$error++;
 				$errorforline++;
 				setEventMessages($langs->trans('ErrorInvoiceContainsLinesNotYetBounded', $val['ref']), null, 'errors');
+				$this->errorforinvoicedetail[$key] = array(
+					'ref' => (string) $val['ref'],
+					'error' => $langs->trans('ErrorInvoiceContainsLinesNotYetBounded', $val['ref']),
+				);
 			}
 
 			// Warranty
@@ -2593,11 +2656,19 @@ class AccountingJournal extends CommonObject
 								$error++;
 								$errorforline++;
 								$errorforinvoice[$key] = 'alreadyjournalized';
+								$this->errorforinvoicedetail[$key] = array(
+									'ref' => (string) $val['ref'],
+									'error' => $langs->trans('BookkeepingRecordAlreadyExists'),
+								);
 							} else {
 								$error++;
 								$errorforline++;
 								$errorforinvoice[$key] = 'other';
 								setEventMessages($bookkeeping->error, $bookkeeping->errors, 'errors');
+								$this->errorforinvoicedetail[$key] = array(
+									'ref' => (string) $val['ref'],
+									'error' => $bookkeeping->errorsToString(),
+								);
 							}
 						}
 					}
@@ -2642,11 +2713,19 @@ class AccountingJournal extends CommonObject
 							$error++;
 							$errorforline++;
 							$errorforinvoice[$key] = 'alreadyjournalized';
+							$this->errorforinvoicedetail[$key] = array(
+								'ref' => (string) $val['ref'],
+								'error' => $langs->trans('BookkeepingRecordAlreadyExists'),
+							);
 						} else {
 							$error++;
 							$errorforline++;
 							$errorforinvoice[$key] = 'other';
 							setEventMessages($bookkeeping->error, $bookkeeping->errors, 'errors');
+							$this->errorforinvoicedetail[$key] = array(
+								'ref' => (string) $val['ref'],
+								'error' => $bookkeeping->errorsToString(),
+							);
 						}
 					} else {
 						if (getDolGlobalInt('ACCOUNTING_ENABLE_LETTERING') && getDolGlobalInt('ACCOUNTING_ENABLE_AUTOLETTERING')) {
@@ -2719,11 +2798,19 @@ class AccountingJournal extends CommonObject
 								$error++;
 								$errorforline++;
 								$errorforinvoice[$key] = 'alreadyjournalized';
+								$this->errorforinvoicedetail[$key] = array(
+									'ref' => (string) $val['ref'],
+									'error' => $langs->trans('BookkeepingRecordAlreadyExists'),
+								);
 							} else {
 								$error++;
 								$errorforline++;
 								$errorforinvoice[$key] = 'other';
 								setEventMessages($bookkeeping->error, $bookkeeping->errors, 'errors');
+								$this->errorforinvoicedetail[$key] = array(
+									'ref' => (string) $val['ref'],
+									'error' => $bookkeeping->errorsToString(),
+								);
 							}
 						}
 					}
@@ -2794,11 +2881,19 @@ class AccountingJournal extends CommonObject
 									$error++;
 									$errorforline++;
 									$errorforinvoice[$key] = 'alreadyjournalized';
+									$this->errorforinvoicedetail[$key] = array(
+										'ref' => (string) $val['ref'],
+										'error' => $langs->trans('BookkeepingRecordAlreadyExists'),
+									);
 								} else {
 									$error++;
 									$errorforline++;
 									$errorforinvoice[$key] = 'other';
 									setEventMessages($bookkeeping->error, $bookkeeping->errors, 'errors');
+									$this->errorforinvoicedetail[$key] = array(
+										'ref' => (string) $val['ref'],
+										'error' => $bookkeeping->errorsToString(),
+									);
 								}
 							}
 						}
@@ -2856,11 +2951,19 @@ class AccountingJournal extends CommonObject
 									$error++;
 									$errorforline++;
 									$errorforinvoice[$key] = 'alreadyjournalized';
+									$this->errorforinvoicedetail[$key] = array(
+										'ref' => (string) $val['ref'],
+										'error' => $langs->trans('BookkeepingRecordAlreadyExists'),
+									);
 								} else {
 									$error++;
 									$errorforline++;
 									$errorforinvoice[$key] = 'other';
 									setEventMessages($bookkeeping->error, $bookkeeping->errors, 'errors');
+									$this->errorforinvoicedetail[$key] = array(
+										'ref' => (string) $val['ref'],
+										'error' => $bookkeeping->errorsToString(),
+									);
 								}
 							}
 						}
@@ -2874,6 +2977,10 @@ class AccountingJournal extends CommonObject
 				$errorforline++;
 				$errorforinvoice[$key] = 'amountsnotbalanced';
 				setEventMessages('We Tried to insert a non balanced transaction in book for '.$invoicestatic->ref.'. Canceled. Surely a bug.', null, 'errors');
+				$this->errorforinvoicedetail[$key] = array(
+					'ref' => (string) $val['ref'],
+					'error' => 'Try to insert a non balanced transaction in book for '.(string) $val['ref'].'. Canceled. Surely a bug.',
+				);
 			}
 
 			if (!$errorforline) {
@@ -3356,6 +3463,7 @@ class AccountingJournal extends CommonObject
 
 		$now = dol_now();
 		$error = 0;
+		$this->errorforinvoicedetail = array();
 
 		$companystatic = new Societe($this->db);
 		$invoicestatic = new FactureFournisseur($this->db);
@@ -3407,6 +3515,10 @@ class AccountingJournal extends CommonObject
 				$error++;
 				$errorforline++;
 				setEventMessages($langs->trans('ErrorInvoiceContainsLinesNotYetBounded', $val['ref']), null, 'errors');
+				$this->errorforinvoicedetail[$key] = array(
+					'ref' => (string) $val['ref'],
+					'error' => $langs->trans('ErrorInvoiceContainsLinesNotYetBounded', $val['ref']),
+				);
 			}
 
 			// Thirdparty
@@ -3447,11 +3559,19 @@ class AccountingJournal extends CommonObject
 							$error++;
 							$errorforline++;
 							$errorforinvoice[$key] = 'alreadyjournalized';
+							$this->errorforinvoicedetail[$key] = array(
+								'ref' => (string) $val['ref'],
+								'error' => $langs->trans('BookkeepingRecordAlreadyExists'),
+							);
 						} else {
 							$error++;
 							$errorforline++;
 							$errorforinvoice[$key] = 'other';
 							setEventMessages($bookkeeping->error, $bookkeeping->errors, 'errors');
+							$this->errorforinvoicedetail[$key] = array(
+								'ref' => (string) $val['ref'],
+								'error' => $bookkeeping->errorsToString(),
+							);
 						}
 					} else {
 						if (getDolGlobalInt('ACCOUNTING_ENABLE_LETTERING') && getDolGlobalInt('ACCOUNTING_ENABLE_AUTOLETTERING')) {
@@ -3524,11 +3644,19 @@ class AccountingJournal extends CommonObject
 								$error++;
 								$errorforline++;
 								$errorforinvoice[$key] = 'alreadyjournalized';
+								$this->errorforinvoicedetail[$key] = array(
+									'ref' => (string) $val['ref'],
+									'error' => $langs->trans('BookkeepingRecordAlreadyExists'),
+								);
 							} else {
 								$error++;
 								$errorforline++;
 								$errorforinvoice[$key] = 'other';
 								setEventMessages($bookkeeping->error, $bookkeeping->errors, 'errors');
+								$this->errorforinvoicedetail[$key] = array(
+									'ref' => (string) $val['ref'],
+									'error' => $bookkeeping->errorsToString(),
+								);
 							}
 						}
 					}
@@ -3621,11 +3749,19 @@ class AccountingJournal extends CommonObject
 									$error++;
 									$errorforline++;
 									$errorforinvoice[$key] = 'alreadyjournalized';
+									$this->errorforinvoicedetail[$key] = array(
+										'ref' => (string) $val['ref'],
+										'error' => $langs->trans('BookkeepingRecordAlreadyExists'),
+									);
 								} else {
 									$error++;
 									$errorforline++;
 									$errorforinvoice[$key] = 'other';
 									setEventMessages($bookkeeping->error, $bookkeeping->errors, 'errors');
+									$this->errorforinvoicedetail[$key] = array(
+										'ref' => (string) $val['ref'],
+										'error' => $bookkeeping->errorsToString(),
+									);
 								}
 							}
 						}
@@ -3671,11 +3807,19 @@ class AccountingJournal extends CommonObject
 								$error++;
 								$errorforline++;
 								$errorforinvoice[$key] = 'alreadyjournalized';
+								$this->errorforinvoicedetail[$key] = array(
+									'ref' => (string) $val['ref'],
+									'error' => $langs->trans('BookkeepingRecordAlreadyExists'),
+								);
 							} else {
 								$error++;
 								$errorforline++;
 								$errorforinvoice[$key] = 'other';
 								setEventMessages($bookkeeping->error, $bookkeeping->errors, 'errors');
+								$this->errorforinvoicedetail[$key] = array(
+									'ref' => (string) $val['ref'],
+									'error' => $bookkeeping->errorsToString(),
+								);
 							}
 						}
 					}
@@ -3688,6 +3832,10 @@ class AccountingJournal extends CommonObject
 				$errorforline++;
 				$errorforinvoice[$key] = 'amountsnotbalanced';
 				setEventMessages('We tried to insert a non balanced transaction in book for '.$invoicestatic->ref.'. Canceled. Surely a bug.', null, 'errors');
+				$this->errorforinvoicedetail[$key] = array(
+					'ref' => (string) $val['ref'],
+					'error' => 'Try to insert a non balanced transaction in book for '.(string) $val['ref'].'. Canceled. Surely a bug.',
+				);
 			}
 
 			if (!$errorforline) {

@@ -1,4 +1,4 @@
-# Accountancy Module REST API — Backlog (Phases 1-13)
+# Accountancy Module REST API — Backlog (Phases 1-14)
 
 ## Status summary
 
@@ -12,7 +12,9 @@ to be a real gap at all — see its section below. Phase 12 is a second follow-u
 `roadmap/API_GAPS_2.md` (real usage feedback from an agent driving this API through the
 `dolibarr-accountancy` MCP server) — implemented. Phase 13, sourced from the same feedback
 (bank-transaction-line gaps, in stock upstream files rather than this fork's own accounting-API
-additions), is implemented.
+additions), is implemented. Phase 14, sourced from a real diagnostic incident (2026-09-02, an
+empty-error 215-invoice VT journal transfer failure), is implemented for journal natures 1/2/3/5;
+nature 4 (bank/treasury) is left open, see its section below.
 
 | Phase | Scope | Status | Key files |
 |---|---|---|---|
@@ -30,6 +32,7 @@ additions), is implemented.
 | 11 | Chart-of-accounts CSV import | Done | new `api_accountingimport.class.php` |
 | 12 | Manual/free "OD" ledger entry creation + VAT-rate accounting-code listing | Done | `api_accountancy.class.php` (`POST ledger`), `api_accountingsetup.class.php` (`GET vatrates/accountingcodes`) |
 | 13 | Bank-transaction-line `accountancycode` update + `list_lines` pagination | Done | `htdocs/compta/bank/class/account.class.php`, `htdocs/compta/bank/class/api_bankaccounts.class.php` |
+| 14 | Per-invoice error detail on `POST journals/{id}/transfer` | Done for natures 1/2/3/5; nature 4 (bank/treasury) open, see below | `accountingjournal.class.php` (`$errorforinvoicedetail` on `writeIntoBookkeeping()`/`writeIntoBookkeepingForXxx()`), `api_accountingjournals.class.php` (`transfer()`'s `errors` field) |
 
 **One non-blocking follow-up, not a functional gap**: `test/phpunit/AccountingBindTest.php`
 (Phase 2) exercises `AccountingAccount::bindInvoiceLine()`/`unbindInvoiceLine()` directly, not the
@@ -1191,3 +1194,55 @@ new column in the `SELECT` is purely additive.
   in Phase 12)
 - `test/phpunit/AccountingLedgerApiTest.php` (extended in Phase 12),
   `test/phpunit/AccountingSetupApiTest.php` (new in Phase 12)
+- `htdocs/accountancy/class/accountingjournal.class.php` (`$errorforinvoicedetail` property +
+  populated in `writeIntoBookkeeping()`/`writeIntoBookkeepingForSells()`/
+  `writeIntoBookkeepingForPurchases()`/`writeIntoBookkeepingForExpenseReports()` in Phase 14)
+- `htdocs/accountancy/class/api_accountingjournals.class.php` (`transfer()`'s `errors` field
+  added in Phase 14)
+- `test/phpunit/AccountingJournalSellsTransferTest.php`,
+  `test/phpunit/AccountingJournalPurchasesTransferTest.php`,
+  `test/phpunit/AccountingJournalExpenseReportsTransferTest.php` (each extended with an
+  error-detail regression test in Phase 14)
+
+## Phase 14 — Per-invoice error detail on `POST journals/{id}/transfer` — Implemented (natures 1/2/3/5), nature 4 open
+
+**Trigger**: a 2026-09-02 diagnostic incident — the first transfer of the VT journal (215 customer
+invoices) failed with an empty `{"success": false, "nb_errors": 1}`. The real cause (`Column
+'label_compte' cannot be null`, from a missing 10% collected-VAT account in the chart of accounts)
+could only be found by reading raw container logs, since `transfer()` discarded everything except
+an error count.
+
+**What changed**: each in-scope `writeIntoBookkeepingFor*()`/`writeIntoBookkeeping()` method
+already built a local `$errorforinvoice` map (`'other'`/`'alreadyjournalized'`/
+`'somelinesarenotbound'`/`'amountsnotbalanced'`) during its per-invoice loop, and on a real
+`BookKeeping::create()` failure already called `setEventMessages($bookkeeping->error,
+$bookkeeping->errors, 'errors')` — a session flash message, invisible to a JSON API caller. Added a
+new public property `AccountingJournal::$errorforinvoicedetail` (`array<int,array{ref:string,
+error:string}>`, reset at the top of each write method) and, at every one of those existing error
+sites, an entry recording the invoice/report ref plus the actual message text (via
+`$bookkeeping->errorsToString()`, or `$langs->trans('BookkeepingRecordAlreadyExists')` for the
+already-journalized case). `AccountingJournals::transfer()` now builds an `errors` array from this
+property and returns it alongside the existing `success`/`nb_errors` fields (purely additive —
+those two fields stay byte-identical for existing consumers), reusing the `{success, errors, ...}`
+shape convention already established by `api_accountingbind.class.php`'s `_bindLines()`.
+
+**Nature 4 (bank/treasury) is explicitly out of scope**: `writeIntoBookkeepingForBank()`/
+`writeIntoBookkeepingForTreasury()` have no `errorforinvoice`-equivalent map to enrich at all today
+(`pendingData()`'s own nature-4 branch already hardcodes `has_error => false` for the same reason).
+Building one means threading a per-bank-line ref+error through bank's payment-type branches and
+treasury's source-type switch — a materially larger change than this phase's scope. `transfer()`'s
+nature-4 branches simply return an empty `errors` array (present, not omitted, so the response
+shape stays uniform across natures) until a future phase closes this gap.
+
+**Verification**: extended `AccountingJournalSellsTransferTest.php`,
+`AccountingJournalPurchasesTransferTest.php`, and `AccountingJournalExpenseReportsTransferTest.php`
+with one regression test each (`testWriteIntoBookkeepingFor*CapturesErrorDetail()`) — each seeds a
+fixture invoice/report pointing at a VAT account deliberately never inserted into
+`accounting_account`, reproducing the real "missing account" failure, and asserts the failing
+invoice/report id is present in `$journal->errorforinvoicedetail` with a non-empty error message
+and the expected `ref`. All 3 pass (the 3 files' full suites total 12 tests, 133 assertions), and the
+pre-existing bank/treasury transfer tests were re-run unchanged to confirm no regression. `phpstan
+analyse -c phpstan.neon.dist --memory-limit 4G -a dev/build/phpstan/bootstrap_action.php
+accountingjournal.class.php api_accountingjournals.class.php` reports no errors. `writeIntoBookkeeping()`
+(nature 1) has no dedicated `*TransferTest.php` today — left without dedicated coverage for this
+phase, same gap the file already had before.
