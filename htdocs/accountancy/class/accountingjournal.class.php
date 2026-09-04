@@ -4635,6 +4635,7 @@ class AccountingJournal extends CommonObject
 		$accountingaccountsuspense->fetch(0, getDolGlobalString('ACCOUNTING_ACCOUNT_SUSPENSE'), true);
 
 		$error = 0;
+		$this->errorforinvoicedetail = array();
 		foreach ($tabpay as $key => $val) {		// $key is rowid into llx_bank
 			$date = dol_print_date($val["date"], 'day');
 
@@ -4707,10 +4708,18 @@ class AccountingJournal extends CommonObject
 								$error++;
 								$errorforline++;
 								setEventMessages('Transaction for ('.$bookkeeping->doc_type.', '.$bookkeeping->fk_doc.', '.$bookkeeping->fk_docdet.') were already recorded', null, 'warnings');
+								$this->errorforinvoicedetail[$key] = array(
+									'ref' => (string) $ref,
+									'error' => $langs->trans('BookkeepingRecordAlreadyExists'),
+								);
 							} else {
 								$error++;
 								$errorforline++;
 								setEventMessages($bookkeeping->error, $bookkeeping->errors, 'errors');
+								$this->errorforinvoicedetail[$key] = array(
+									'ref' => (string) $ref,
+									'error' => $bookkeeping->errorsToString(),
+								);
 							}
 						}
 					}
@@ -4879,10 +4888,18 @@ class AccountingJournal extends CommonObject
 									$error++;
 									$errorforline++;
 									setEventMessages('Transaction for ('.$bookkeeping->doc_type.', '.$bookkeeping->fk_doc.', '.$bookkeeping->fk_docdet.') were already recorded', null, 'warnings');
+									$this->errorforinvoicedetail[$key] = array(
+										'ref' => (string) $ref,
+										'error' => $langs->trans('BookkeepingRecordAlreadyExists'),
+									);
 								} else {
 									$error++;
 									$errorforline++;
 									setEventMessages($bookkeeping->error, $bookkeeping->errors, 'errors');
+									$this->errorforinvoicedetail[$key] = array(
+										'ref' => (string) $ref,
+										'error' => $bookkeeping->errorsToString(),
+									);
 								}
 							} else {
 								if ($lettering && getDolGlobalInt('ACCOUNTING_ENABLE_LETTERING') && getDolGlobalInt('ACCOUNTING_ENABLE_AUTOLETTERING')) {
@@ -4930,10 +4947,18 @@ class AccountingJournal extends CommonObject
 									$error++;
 									$errorforline++;
 									setEventMessages('Transaction for ('.$bookkeeping->doc_type.', '.$bookkeeping->fk_doc.', '.$bookkeeping->fk_docdet.') were already recorded', null, 'warnings');
+									$this->errorforinvoicedetail[$key] = array(
+										'ref' => (string) $ref,
+										'error' => $langs->trans('BookkeepingRecordAlreadyExists'),
+									);
 								} else {
 									$error++;
 									$errorforline++;
 									setEventMessages($bookkeeping->error, $bookkeeping->errors, 'errors');
+									$this->errorforinvoicedetail[$key] = array(
+										'ref' => (string) $ref,
+										'error' => $bookkeeping->errorsToString(),
+									);
 								}
 							}
 						}
@@ -4945,6 +4970,10 @@ class AccountingJournal extends CommonObject
 				$error++;
 				$errorforline++;
 				setEventMessages('We tried to insert a non balanced transaction in book for '.$ref.'. Canceled. Surely a bug.', null, 'errors');
+				$this->errorforinvoicedetail[$key] = array(
+					'ref' => (string) $ref,
+					'error' => 'Try to insert a non balanced transaction in book for '.(string) $ref.'. Canceled. Surely a bug.',
+				);
 			}
 
 			if (!$errorforline) {
@@ -6033,6 +6062,7 @@ class AccountingJournal extends CommonObject
 		$accountingaccount = new AccountingAccount($this->db);
 
 		$error = 0;
+		$this->errorforinvoicedetail = array();
 		foreach ($tabpay as $payment_id => $payment) {
 			$accountInfos = $tabaccount[$payment["fk_bank_account"]];
 
@@ -6041,6 +6071,14 @@ class AccountingJournal extends CommonObject
 				$result = $accountingaccount->fetch(0, $accountInfos['account_number'], true);
 				if ($result < 0) {
 					setEventMessages($accountingaccount->error, $accountingaccount->errors, 'errors');
+					// AccountingAccount::fetch() leaves $this->errors empty when called with no
+					// rowid/account_number at all (e.g. the bank account has no GL account_number
+					// configured) - fall back to a descriptive message so this per-line detail is
+					// never silently empty.
+					$this->errorforinvoicedetail[$payment_id] = array(
+						'ref' => (string) $payment['ref'],
+						'error' => $accountingaccount->errorsToString() !== '' ? $accountingaccount->errorsToString() : 'Unable to fetch accounting account for account number "'.$accountInfos['account_number'].'"',
+					);
 					$error++;
 					break;
 				}
@@ -6079,6 +6117,10 @@ class AccountingJournal extends CommonObject
 						if (!empty($bookkeepingToCreate->errors)) {
 							setEventMessages(null, $bookkeepingToCreate->errors, 'errors');
 						}
+						$this->errorforinvoicedetail[$payment_id] = array(
+							'ref' => (string) $objectInfos['ref'],
+							'error' => $bookkeepingToCreate->errorsToString(),
+						);
 					}
 				}
 
@@ -6125,6 +6167,10 @@ class AccountingJournal extends CommonObject
 							if (!empty($bookkeepingToCreate->errors)) {
 								setEventMessages(null, $bookkeepingToCreate->errors, 'errors');
 							}
+							$this->errorforinvoicedetail[$payment_id] = array(
+								'ref' => (string) $objectInfos['ref'],
+								'error' => $bookkeepingToCreate->errorsToString(),
+							);
 						}
 					}
 					$idx++;
@@ -6174,6 +6220,10 @@ class AccountingJournal extends CommonObject
 								if (!empty($bookkeepingToCreate->errors)) {
 									setEventMessages(null, $bookkeepingToCreate->errors, 'errors');
 								}
+								$this->errorforinvoicedetail[$payment_id] = array(
+									'ref' => (string) $objectInfos['ref'],
+									'error' => $bookkeepingToCreate->errorsToString(),
+								);
 							}
 						}
 						$idx++;
@@ -6197,6 +6247,10 @@ class AccountingJournal extends CommonObject
 						if (!empty($bookkeepingToCreate->errors)) {
 							setEventMessages(null, $bookkeepingToCreate->errors, 'errors');
 						}
+						$this->errorforinvoicedetail[$payment_id] = array(
+							'ref' => (string) $objectInfos['ref'],
+							'error' => $bookkeepingToCreate->errorsToString(),
+						);
 					}
 				}
 
@@ -6204,6 +6258,10 @@ class AccountingJournal extends CommonObject
 				if (!empty($total_check)) {
 					$errorforline++;
 					setEventMessages($langs->trans('ErrorBookkeepingTryInsertNotBalancedTransactionAndCanceled', $objectInfos['ref'], $object_data['bu_url_id']), null, 'errors');
+					$this->errorforinvoicedetail[$payment_id] = array(
+						'ref' => (string) $objectInfos['ref'],
+						'error' => $langs->trans('ErrorBookkeepingTryInsertNotBalancedTransactionAndCanceled', $objectInfos['ref'], $object_data['bu_url_id']),
+					);
 				}
 
 				if ($errorforline) {

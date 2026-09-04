@@ -13,10 +13,10 @@ to be a real gap at all — see its section below. Phase 12 is a second follow-u
 `dolibarr-accountancy` MCP server) — implemented. Phase 13, sourced from the same feedback
 (bank-transaction-line gaps, in stock upstream files rather than this fork's own accounting-API
 additions), is implemented. Phase 14, sourced from a real diagnostic incident (2026-09-02, an
-empty-error 215-invoice VT journal transfer failure), is implemented for journal natures 1/2/3/5;
-nature 4 (bank/treasury) is left open as Phase 15, tracked separately below (the `dolibarr-mcp`
-consumer already ships a static "no per-line detail for bank/treasury" hint in the interim, so this
-phase is about closing the gap at the source, not unblocking that caller).
+empty-error 215-invoice VT journal transfer failure), is implemented for journal natures 1/2/3/5.
+Phase 15 closes the nature 4 (bank/treasury) gap Phase 14 explicitly scoped out — implemented (the
+`dolibarr-mcp` consumer's static "no per-line detail for bank/treasury" interim hint is now stale
+and should be removed by whoever maintains that repo).
 
 | Phase | Scope | Status | Key files |
 |---|---|---|---|
@@ -34,8 +34,8 @@ phase is about closing the gap at the source, not unblocking that caller).
 | 11 | Chart-of-accounts CSV import | Done | new `api_accountingimport.class.php` |
 | 12 | Manual/free "OD" ledger entry creation + VAT-rate accounting-code listing | Done | `api_accountancy.class.php` (`POST ledger`), `api_accountingsetup.class.php` (`GET vatrates/accountingcodes`) |
 | 13 | Bank-transaction-line `accountancycode` update + `list_lines` pagination | Done | `htdocs/compta/bank/class/account.class.php`, `htdocs/compta/bank/class/api_bankaccounts.class.php` |
-| 14 | Per-invoice error detail on `POST journals/{id}/transfer` | Done for natures 1/2/3/5; nature 4 (bank/treasury) open, see Phase 15 | `accountingjournal.class.php` (`$errorforinvoicedetail` on `writeIntoBookkeeping()`/`writeIntoBookkeepingForXxx()`), `api_accountingjournals.class.php` (`transfer()`'s `errors` field) |
-| 15 | Per-invoice error detail for nature 4 (bank/treasury) transfers | Open | `accountingjournal.class.php` (`writeIntoBookkeepingForBank()`, `writeIntoBookkeepingForTreasury()`), `api_accountingjournals.class.php` (`transfer()`) |
+| 14 | Per-invoice error detail on `POST journals/{id}/transfer` | Done for natures 1/2/3/5 | `accountingjournal.class.php` (`$errorforinvoicedetail` on `writeIntoBookkeeping()`/`writeIntoBookkeepingForXxx()`), `api_accountingjournals.class.php` (`transfer()`'s `errors` field) |
+| 15 | Per-invoice error detail for nature 4 (bank/treasury) transfers | Done | `accountingjournal.class.php` (`writeIntoBookkeepingForBank()`, `writeIntoBookkeepingForTreasury()`), `api_accountingjournals.class.php` (`transfer()`) |
 
 **One non-blocking follow-up, not a functional gap**: `test/phpunit/AccountingBindTest.php`
 (Phase 2) exercises `AccountingAccount::bindInvoiceLine()`/`unbindInvoiceLine()` directly, not the
@@ -1199,15 +1199,17 @@ new column in the `SELECT` is purely additive.
   `test/phpunit/AccountingSetupApiTest.php` (new in Phase 12)
 - `htdocs/accountancy/class/accountingjournal.class.php` (`$errorforinvoicedetail` property +
   populated in `writeIntoBookkeeping()`/`writeIntoBookkeepingForSells()`/
-  `writeIntoBookkeepingForPurchases()`/`writeIntoBookkeepingForExpenseReports()` in Phase 14)
+  `writeIntoBookkeepingForPurchases()`/`writeIntoBookkeepingForExpenseReports()` in Phase 14,
+  `writeIntoBookkeepingForBank()`/`writeIntoBookkeepingForTreasury()` in Phase 15)
 - `htdocs/accountancy/class/api_accountingjournals.class.php` (`transfer()`'s `errors` field
-  added in Phase 14)
+  added in Phase 14; needed no code change in Phase 15, only a docblock correction — see Phase 15)
 - `test/phpunit/AccountingJournalSellsTransferTest.php`,
   `test/phpunit/AccountingJournalPurchasesTransferTest.php`,
   `test/phpunit/AccountingJournalExpenseReportsTransferTest.php` (each extended with an
-  error-detail regression test in Phase 14)
+  error-detail regression test in Phase 14), `test/phpunit/AccountingJournalBankTransferTest.php`,
+  `test/phpunit/AccountingJournalTreasuryTransferTest.php` (same, in Phase 15)
 
-## Phase 14 — Per-invoice error detail on `POST journals/{id}/transfer` — Implemented (natures 1/2/3/5), nature 4 open
+## Phase 14 — Per-invoice error detail on `POST journals/{id}/transfer` — Implemented (natures 1/2/3/5)
 
 **Trigger**: a 2026-09-02 diagnostic incident — the first transfer of the VT journal (215 customer
 invoices) failed with an empty `{"success": false, "nb_errors": 1}`. The real cause (`Column
@@ -1229,13 +1231,12 @@ property and returns it alongside the existing `success`/`nb_errors` fields (pur
 those two fields stay byte-identical for existing consumers), reusing the `{success, errors, ...}`
 shape convention already established by `api_accountingbind.class.php`'s `_bindLines()`.
 
-**Nature 4 (bank/treasury) is explicitly out of scope**: `writeIntoBookkeepingForBank()`/
-`writeIntoBookkeepingForTreasury()` have no `errorforinvoice`-equivalent map to enrich at all today
-(`pendingData()`'s own nature-4 branch already hardcodes `has_error => false` for the same reason).
-Building one means threading a per-bank-line ref+error through bank's payment-type branches and
-treasury's source-type switch — a materially larger change than this phase's scope. `transfer()`'s
-nature-4 branches simply return an empty `errors` array (present, not omitted, so the response
-shape stays uniform across natures) until a future phase closes this gap.
+**Nature 4 (bank/treasury) was explicitly out of scope for this phase**: `writeIntoBookkeepingForBank()`/
+`writeIntoBookkeepingForTreasury()` had no `errorforinvoice`-equivalent map to enrich at all
+(`pendingData()`'s own nature-4 branch still hardcodes `has_error => false` for the same
+underlying reason — that endpoint's gap is not what this phase or Phase 15 closes). Threading a
+per-bank-line ref+error through bank's payment-type branches and treasury's source-type switch was
+a materially larger change than this phase's scope — see Phase 15 below, which closes it.
 
 **Verification**: extended `AccountingJournalSellsTransferTest.php`,
 `AccountingJournalPurchasesTransferTest.php`, and `AccountingJournalExpenseReportsTransferTest.php`
@@ -1250,41 +1251,71 @@ accountingjournal.class.php api_accountingjournals.class.php` reports no errors.
 (nature 1) has no dedicated `*TransferTest.php` today — left without dedicated coverage for this
 phase, same gap the file already had before.
 
-## Phase 15 — Per-invoice error detail for nature 4 (bank/treasury) transfers — Open
+## Phase 15 — Per-invoice error detail for nature 4 (bank/treasury) transfers — Implemented
 
 **Trigger**: the explicit scope cut from Phase 14 above. `writeIntoBookkeepingForBank()` and
-`writeIntoBookkeepingForTreasury()` have no `$errorforinvoicedetail`-equivalent map at all today,
-so `AccountingJournals::transfer()` returns an empty `errors` array for nature-4 journals
-regardless of whether the transfer actually failed (`pendingData()`'s nature-4 branch already
-hardcodes `has_error => false` for the same underlying reason). Consumers can currently only tell
-via `success`/`nb_errors` that *something* failed, with zero indication of which bank line/payment
-and why — the same blind spot Phase 14 closed for natures 1/2/3/5. In the interim, the
-`dolibarr-mcp` MCP server (a downstream consumer of this API) ships a static hint noting the gap
-so its calling agents don't waste time re-asking for detail that isn't there yet.
+`writeIntoBookkeepingForTreasury()` had no `$errorforinvoicedetail`-equivalent map at all, so
+`AccountingJournals::transfer()` returned an empty `errors` array for nature-4 journals regardless
+of whether the transfer actually failed (`pendingData()`'s nature-4 branch still hardcodes
+`has_error => false` for the same underlying reason — that endpoint's gap is separate and not
+touched by this phase, see the Scope note below). Consumers could previously only tell via
+`success`/`nb_errors` that *something* failed, with zero indication of which bank line/payment and
+why — the same blind spot Phase 14 closed for natures 1/2/3/5.
 
-**Scope**: add a per-line `ref`+`error` capture to both write methods, mirroring Phase 14's
-pattern (`AccountingJournal::$errorforinvoicedetail`, populated at each existing failure site,
-consumed by `AccountingJournals::transfer()`):
-- `writeIntoBookkeepingForBank()` — thread capture through its payment-type branches (each handles
-  a different `AccountLine`/payment source: customer/supplier invoice payments, salary payments,
-  VAT payments, social/fiscal charge payments, donations, loan payments, various payments, etc.).
-  Materially more branches than any single Phase 14 method, since bank transactions fan out by
-  payment type rather than by a single invoice-like source object.
-- `writeIntoBookkeepingForTreasury()` — thread capture through its source-type switch analogously.
-- Extend `AccountingJournals::transfer()` to also read `$errorforinvoicedetail` for nature-4
-  journals, dropping the current hardcoded-empty branch (should become a byte-for-byte "no special
-  case" once both write methods populate the property — natures 1/2/3/4/5 all funnel through the
-  same `transfer()` code Phase 14 added).
-- Once implemented, `dolibarr-mcp`'s static "no detail for bank/treasury" hint (in
-  `accounting_journal_transfer`'s tool description and the nature-4 `note` field it adds to
-  `transfer` responses) becomes stale and should be removed by whoever maintains that repo.
+**What changed**: threaded `AccountingJournal::$errorforinvoicedetail` capture through both write
+methods, mirroring Phase 14's pattern exactly (same `array<int,array{ref:string,error:string}>`
+shape, keyed by bank line rowid in both methods — the natural per-transaction granularity for
+nature 4, unlike sells/purchases/expense-reports' per-invoice/report keying):
+- `writeIntoBookkeepingForBank()` (`accountingjournal.class.php`) — capture added at all 4 of its
+  pre-existing error sites: the bank-line `create()` (both the `BookkeepingRecordAlreadyExists`
+  and generic-failure branches), the thirdparty-branch `create()` (same two branches, covering all
+  11 payment-type sub-cases since they share one `create()` call site), the waiting-account
+  fallback `create()` (same two branches), and the balance-check (`price2num($totaldebit) !=
+  price2num($totalcredit)`). Reused `$ref` (from the pre-existing `getSourceDocRefForBank()` call)
+  as the captured `ref`, same as `$val['ref']` is used for sells/purchases/expense reports.
+- `writeIntoBookkeepingForTreasury()` (`accountingjournal.class.php`) — capture added at all 5 of
+  its pre-existing error sites: the "Set accounting account infos" account-fetch failure (one per
+  payment, keyed by `$payment_id`), the "Operations" loop's `createFromValues()` failure, the
+  "VATs" loop's `createFromValues()` failure, the "Show bank line" `createFromValues()` failure
+  (both the positive- and negative-amount branches share one capture site each), and the
+  not-balanced check (`if (!empty($total_check))`). Reused `$objectInfos['ref']` (or `$payment['ref']`
+  for the account-fetch site, which runs before `$objectInfos` is in scope) as the captured `ref`.
+  One real, pre-existing gap found and worked around while wiring this up:
+  `AccountingAccount::fetch()` leaves `$this->errors` completely empty when called with a
+  falsy/empty account number (its `if ($rowid || $account_number)` guard is skipped entirely,
+  falling through to a bare `return -1;` with no error ever set) — unlike a genuine DB-level
+  failure, which does populate `$this->errors`. Left `AccountingAccount::fetch()` itself untouched
+  (out of scope, and every other caller already tolerates this), but added a fallback message
+  ('Unable to fetch accounting account for account number "..."') at this one capture site so a
+  misconfigured-bank-account failure (no GL `account_number` set) still surfaces real, non-empty
+  detail instead of an empty string — the same "must carry the actual message" bar Phase 14 set.
+- `AccountingJournals::transfer()` (`api_accountingjournals.class.php`) needed **no code change at
+  all** for this: it already reads `$journal->errorforinvoicedetail` generically for every nature
+  (`foreach ($journal->errorforinvoicedetail as $invoiceid => $detail) { ... }`, no nature-based
+  branching) — there was no hardcoded-empty special case to remove, contrary to what this section
+  originally assumed before Phase 14 shipped. Once both write methods above populate the property,
+  `transfer()`'s existing generic loop picks it up automatically. Only the method's docblock
+  (which stated the old nature-4 limitation) was corrected.
 
-**Verification (proposed, mirroring Phase 14)**: add
-`testWriteIntoBookkeepingForBankCapturesErrorDetail()`/
-`testWriteIntoBookkeepingForTreasuryCapturesErrorDetail()`-style regression tests to
-`AccountingJournalBankTransferTest.php`/`AccountingJournalTreasuryTransferTest.php`, each seeding a
-fixture bank line that deliberately fails (e.g. missing/invalid accounting account) and asserting
-the failing line's id/ref and a non-empty error message land in
-`$journal->errorforinvoicedetail`. Re-run the full bank/treasury transfer suites plus phpstan on
-`accountingjournal.class.php`/`api_accountingjournals.class.php` to confirm no regression on the
-natures 1/2/3/5 path Phase 14 already covers.
+**Verification**: added `testWriteIntoBookkeepingForBankCapturesErrorDetail()`
+(`AccountingJournalBankTransferTest.php`) — seeds the same golden-baseline payment fixture as the
+existing bank test but points `ACCOUNTING_ACCOUNT_CUSTOMER` at an account never seeded into the
+chart of accounts (mirroring Phase 14's sells-test technique), reproducing the real "missing
+account" `label_compte` NOT NULL failure at the thirdparty-branch `create()` site — and
+`testWriteIntoBookkeepingForTreasuryCapturesErrorDetail()`
+(`AccountingJournalTreasuryTransferTest.php`) — uses a `PaymentVarious` fixture (simplest treasury
+fixture, no invoice needed, same pattern as the file's existing `PaymentVariousBranch` test) into a
+bank account deliberately created with no GL `account_number` at all, reproducing the
+misconfigured-bank-account failure at the "Set accounting account infos" site. Both assert
+`$journal->errorforinvoicedetail` is populated with the failing bank line's id and a non-empty
+error message, and that the overall transfer result is `< 0`. All pre-existing tests in both files
+(3 each) were re-run and still pass unchanged (6 tests, 87 assertions total across both files), as
+were `AccountingJournalSellsTransferTest.php`/`AccountingJournalPurchasesTransferTest.php`/
+`AccountingJournalExpenseReportsTransferTest.php` (12 tests, 133 assertions), confirming no
+regression on the natures 1/2/3/5 path Phase 14 already covers. `phpstan analyse -c
+phpstan.neon.dist --memory-limit 4G -a dev/build/phpstan/bootstrap_action.php
+accountingjournal.class.php api_accountingjournals.class.php` reports no errors.
+
+Once this phase reached the codebase, `dolibarr-mcp`'s static "no detail for bank/treasury" hint
+(in `accounting_journal_transfer`'s tool description and the nature-4 `note` field it adds to
+`transfer` responses) became stale — should be removed by whoever maintains that repo.

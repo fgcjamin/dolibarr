@@ -388,4 +388,76 @@ class AccountingJournalTreasuryTransferTest extends CommonClassTest
 		$this->assertArrayHasKey('627958', $byAccount, 'Counterpart must land on the PaymentVarious row\'s own accountancy_code');
 		$this->assertEqualsWithDelta(75.0, (float) $byAccount['627958']->credit, 0.01);
 	}
+
+	/**
+	 * Phase 15 regression test: a transfer failure (here, the bank account has no GL
+	 * account_number configured at all, so the 'Set accounting account infos' block's
+	 * AccountingAccount::fetch(0, '', true) call hits its no-rowid/no-account_number fallthrough
+	 * and returns -1) must be captured per-bank-line in
+	 * AccountingJournal::$errorforinvoicedetail, the same way Phase 14 already covers natures
+	 * 1/2/3/5 - closing the gap AccountingJournalSellsTransferTest.php's
+	 * testWriteIntoBookkeepingForSellsCapturesErrorDetail() documents for nature 4.
+	 *
+	 * @return void
+	 */
+	public function testWriteIntoBookkeepingForTreasuryCapturesErrorDetail()
+	{
+		global $conf,$user,$langs,$db;
+		$conf = $this->savconf;
+		$user = $this->savuser;
+		$langs = $this->savlangs;
+		$db = $this->savdb;
+
+		$year = 2966;
+
+		$period = new Fiscalyear($db);
+		$period->label = 'AccountingJournalTreasuryTransferTest errordetail period '.$year;
+		$period->date_start = dol_mktime(0, 0, 0, 1, 1, $year);
+		$period->date_end = dol_mktime(23, 59, 59, 12, 31, $year);
+		$period_id = $period->create($user);
+		$this->assertGreaterThan(0, $period_id, $period->errorsToString());
+		unset($conf->cache['active_fiscal_period_cached']);
+
+		$conf->global->ACCOUNTING_MODE = 'RECETTES-DEPENSES';
+
+		$sql = "SELECT rowid, pcg_version FROM ".MAIN_DB_PREFIX."accounting_system WHERE pcg_version = 'PCG25-DEV'";
+		$res = $db->query($sql);
+		$chart = $db->fetch_object($res);
+		$conf->global->CHARTOFACCOUNTS = (int) $chart->rowid;
+
+		$journal = $this->fetchTreasuryJournal($db);
+		// Deliberately create the bank account with no GL account_number at all - a
+		// misconfigured bank account, reproducing the real-world "bank account not linked to an
+		// accounting account" failure.
+		$bankAccount = $this->createBankAccount($db, $user, (int) $journal->id, 'ACJTR'.$year, '');
+
+		$dateLine = dol_mktime(12, 0, 0, 6, 15, $year);
+
+		$paymentVarious = new PaymentVarious($db);
+		$paymentVarious->label = 'AccountingJournalTreasuryTransferTest errordetail payment';
+		$paymentVarious->datep = $dateLine;
+		$paymentVarious->datev = $dateLine;
+		$paymentVarious->amount = 75;
+		$paymentVarious->sens = 1; // money in
+		$paymentVarious->accountancy_code = '627966';
+		$paymentVarious->subledger_account = '';
+		$paymentVarious->fk_account = $bankAccount->id;
+		$paymentVarious->type_payment = dol_getIdFromCode($db, 'VIR', 'c_paiement', 'code', 'id', 1);
+		$paymentVariousId = $paymentVarious->create($user);
+		$this->assertGreaterThan(0, $paymentVariousId, (string) $paymentVarious->error);
+
+		// create() links the bank line via update_fk_bank(), which updates the DB row but does
+		// not populate $this->fk_bank on the in-memory object - re-fetch to get it.
+		$paymentVarious->fetch($paymentVariousId);
+		$bankLineId = (int) $paymentVarious->fk_bank;
+		$this->assertGreaterThan(0, $bankLineId, 'PaymentVarious::create() must have linked a bank line');
+
+		$date_start = dol_mktime(0, 0, 0, 1, 1, $year);
+		$date_end = dol_mktime(23, 59, 59, 12, 31, $year);
+
+		$result = $journal->writeIntoBookkeepingForTreasury($user, $date_start, $date_end);
+		$this->assertLessThan(0, $result, 'Transfer must report an error when the bank account has no GL account_number configured');
+		$this->assertArrayHasKey($bankLineId, $journal->errorforinvoicedetail, 'The failing bank line must be captured in errorforinvoicedetail');
+		$this->assertNotEmpty($journal->errorforinvoicedetail[$bankLineId]['error'], 'The per-line error detail must carry an actual error message, not be empty');
+	}
 }

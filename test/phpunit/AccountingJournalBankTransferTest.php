@@ -359,4 +359,95 @@ class AccountingJournalBankTransferTest extends CommonClassTest
 		$this->assertArrayHasKey('471999', $byAccount, 'Counterpart must land on the configured suspense account');
 		$this->assertEqualsWithDelta(50.0, (float) $byAccount['471999']->credit, 0.01);
 	}
+
+	/**
+	 * Phase 15 regression test: a transfer failure (here, ACCOUNTING_ACCOUNT_CUSTOMER pointing
+	 * at an account never seeded into the chart of accounts, so
+	 * $accountingaccountcustomer->label stays null and the 'payment' branch's
+	 * BookKeeping::create() hits the NOT NULL 'label_compte' constraint) must be captured
+	 * per-bank-line in AccountingJournal::$errorforinvoicedetail, the same way Phase 14 already
+	 * covers natures 1/2/3/5 - closing the gap AccountingJournalSellsTransferTest.php's
+	 * testWriteIntoBookkeepingForSellsCapturesErrorDetail() documents for nature 4.
+	 *
+	 * @return void
+	 */
+	public function testWriteIntoBookkeepingForBankCapturesErrorDetail()
+	{
+		global $conf,$user,$langs,$db;
+		$conf = $this->savconf;
+		$user = $this->savuser;
+		$langs = $this->savlangs;
+		$db = $this->savdb;
+
+		$year = 2965;
+
+		$period = new Fiscalyear($db);
+		$period->label = 'AccountingJournalBankTransferTest errordetail period '.$year;
+		$period->date_start = dol_mktime(0, 0, 0, 1, 1, $year);
+		$period->date_end = dol_mktime(23, 59, 59, 12, 31, $year);
+		$period_id = $period->create($user);
+		$this->assertGreaterThan(0, $period_id, $period->errorsToString());
+		unset($conf->cache['active_fiscal_period_cached']);
+
+		$sql = "SELECT rowid, pcg_version FROM ".MAIN_DB_PREFIX."accounting_system WHERE pcg_version = 'PCG25-DEV'";
+		$res = $db->query($sql);
+		$chart = $db->fetch_object($res);
+		$conf->global->CHARTOFACCOUNTS = (int) $chart->rowid;
+		// Deliberately point at a customer control account that is never seeded into
+		// accounting_account - reproduces the real-world "missing account in the chart of
+		// accounts" failure.
+		$conf->global->ACCOUNTING_ACCOUNT_CUSTOMER = '411965';
+
+		$this->seedAccount($db, $chart->pcg_version, '512965', 'AccountingJournalBankTransferTest errordetail bank');
+
+		$journal = $this->fetchBankJournal($db);
+		$bankAccount = $this->createBankAccount($db, $user, (int) $journal->id, 'ACJBK'.$year, '512965');
+
+		$dateLine = dol_mktime(12, 0, 0, 6, 15, $year);
+
+		$soc = new Societe($db);
+		$soc->name = 'AccountingJournalBankTransferTest errordetail customer';
+		$soc->client = 1;
+		$soc->code_client = '-1';
+		$socId = $soc->create($user);
+		$this->assertGreaterThan(0, $socId, (string) $soc->error);
+
+		$fac = new Facture($db);
+		$fac->socid = $socId;
+		$fac->date = $dateLine;
+		$fac->type = Facture::TYPE_STANDARD;
+		$facId = $fac->create($user);
+		$this->assertGreaterThan(0, $facId, (string) $fac->error);
+
+		$lineId = $fac->addline('AccountingJournalBankTransferTest errordetail line', 100, 1, 20);
+		$this->assertGreaterThan(0, $lineId, (string) $fac->error);
+
+		$valResult = $fac->validate($user);
+		$this->assertGreaterThanOrEqual(0, $valResult, (string) $fac->error);
+
+		$thirdparty = new Societe($db);
+		$thirdparty->fetch($socId);
+
+		$paiement = new Paiement($db);
+		$paiement->datepaye = $dateLine;
+		$paiement->amounts = array($facId => 120);
+		$paiement->paiementcode = 'VIR';
+		$paiement->paiementid = dol_getIdFromCode($db, 'VIR', 'c_paiement', 'code', 'id', 1);
+		$paiement->note_private = 'AccountingJournalBankTransferTest errordetail payment';
+		$paiement->fk_account = $bankAccount->id;
+		$paiementId = $paiement->create($user, 1, $thirdparty);
+		$this->assertGreaterThan(0, $paiementId, implode(',', $paiement->errors));
+
+		$bankLineId = $paiement->addPaymentToBank($user, 'payment', '(CustomerInvoicePayment)', $bankAccount->id, '', '');
+		$this->assertGreaterThan(0, $bankLineId, implode(',', $paiement->errors));
+
+		$date_start = dol_mktime(0, 0, 0, 1, 1, $year);
+		$date_end = dol_mktime(23, 59, 59, 12, 31, $year);
+
+		$result = $journal->writeIntoBookkeepingForBank($user, $date_start, $date_end);
+		$this->assertLessThan(0, $result, 'Transfer must report an error when the customer control account is missing from the chart of accounts');
+		$this->assertArrayHasKey($bankLineId, $journal->errorforinvoicedetail, 'The failing bank line must be captured in errorforinvoicedetail');
+		$this->assertNotEmpty($journal->errorforinvoicedetail[$bankLineId]['ref'], 'The per-line error detail must carry a ref');
+		$this->assertNotEmpty($journal->errorforinvoicedetail[$bankLineId]['error'], 'The per-line error detail must carry the actual server error message, not be empty');
+	}
 }

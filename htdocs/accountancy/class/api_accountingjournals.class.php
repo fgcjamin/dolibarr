@@ -296,9 +296,9 @@ class AccountingJournals extends DolibarrApi
 	 * @param	array	$request_data	Request data
 	 * @phan-param array{date_start?:int,date_end?:int} $request_data
 	 * @phpstan-param array{date_start?:int,date_end?:int} $request_data
-	 * `errors` carries, for each invoice/report that failed, its id, ref and the actual server
-	 * error message (natures 1/2/3/5 only - nature 4/bank-treasury has no per-line error map to
-	 * report from yet, see roadmap/backlog.md, so `errors` is always empty for that nature).
+	 * `errors` carries, for each invoice/report/bank line that failed, its id, ref and the actual
+	 * server error message - populated for every nature, including 4 (bank/treasury, see
+	 * roadmap/backlog.md Phase 15).
 	 *
 	 * @return	array
 	 * @phan-return array{success:bool,nb_errors:int,errors:array<array{id:int,ref:string,error:string}>}
