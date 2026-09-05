@@ -26,6 +26,8 @@
 global $conf,$user,$langs,$db;
 require_once dirname(__FILE__).'/../../htdocs/master.inc.php';
 require_once dirname(__FILE__).'/../../htdocs/accountancy/class/bookkeeping.class.php';
+require_once dirname(__FILE__).'/../../htdocs/core/class/fiscalyear.class.php';
+require_once dirname(__FILE__).'/../../htdocs/core/lib/date.lib.php';
 require_once dirname(__FILE__).'/CommonClassTest.class.php';
 
 if (empty($user->id)) {
@@ -57,6 +59,20 @@ class BookKeepingTest extends CommonClassTest
 		$user = $this->savuser;
 		$langs = $this->savlangs;
 		$db = $this->savdb;
+
+		// BookKeeping::initAsSpecimen() dates the entry "now", and BookKeeping::create() rejects
+		// any doc_date outside an active fiscal period - a fresh/CI DB has none by default, so one
+		// covering today must be created here rather than assumed to already exist.
+		$currentYear = (int) date('Y');
+		$period = new Fiscalyear($db);
+		$period->label = 'BookKeepingTest current period';
+		$period->date_start = dol_mktime(0, 0, 0, 1, 1, $currentYear);
+		$period->date_end = dol_mktime(23, 59, 59, 12, 31, $currentYear);
+		$period_id = $period->create($user);
+		$this->assertGreaterThan(0, $period_id, $period->errorsToString());
+		// BookKeeping::validBookkeepingDate()/loadFiscalPeriods() caches the active-fiscal-period
+		// list per process and never auto-refreshes it.
+		unset($conf->cache['active_fiscal_period_cached']);
 
 		$soc = new Societe($db);
 		$soc->name = "BookKeepingTest Unittest";

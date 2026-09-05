@@ -199,6 +199,34 @@ class BankAccountLineAccountancyCodeTest extends CommonClassTest
 	}
 
 	/**
+	 * BankAccounts::updateLine()'s $label parameter is optional: omitting it updates the
+	 * accountancy code alone without touching (or blanking) the existing label.
+	 *
+	 * @return void
+	 */
+	public function testApiUpdateLineAccountancyCodeWithoutLabel()
+	{
+		global $conf,$user,$langs,$db;
+		$conf = $this->savconf;
+		$user = $this->savuser;
+		$langs = $this->savlangs;
+		$db = $this->savdb;
+
+		list($account, $lineIds) = $this->seedAccountAndLines();
+
+		DolibarrApiAccess::$user = $user;
+		$api = new BankAccounts($db);
+
+		$resId = $api->updateLine($account->id, $lineIds[0], '', 'APICODEONLY1');
+		$this->assertEquals($lineIds[0], $resId);
+
+		$reload = new AccountLine($db);
+		$reload->fetch($lineIds[0]);
+		$this->assertSame('BankAccountLineAccountancyCodeTest line 1', $reload->label, 'Omitting label must leave it unchanged');
+		$this->assertSame('APICODEONLY1', $reload->numero_compte);
+	}
+
+	/**
 	 * BankAccounts::getLines()'s new $limit/$page parameters page through an account's lines
 	 * without gaps or overlap between pages.
 	 *

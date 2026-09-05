@@ -27,12 +27,13 @@ use Luracast\Restler\RestException;
 
 global $conf,$user,$langs,$db;
 require_once dirname(__FILE__).'/../../htdocs/master.inc.php';
+require_once dirname(__FILE__).'/../../htdocs/api/class/api.class.php';
+require_once dirname(__FILE__).'/../../htdocs/api/class/api_access.class.php';
 require_once dirname(__FILE__).'/../../htdocs/accountancy/class/api_accountancy.class.php';
 require_once dirname(__FILE__).'/../../htdocs/accountancy/class/bookkeeping.class.php';
 require_once dirname(__FILE__).'/../../htdocs/accountancy/class/lettering.class.php';
 require_once dirname(__FILE__).'/../../htdocs/core/class/fiscalyear.class.php';
 require_once dirname(__FILE__).'/../../htdocs/societe/class/societe.class.php';
-require_once dirname(__FILE__).'/../../htdocs/api/class/api_access.class.php';
 require_once dirname(__FILE__).'/CommonClassTest.class.php';
 
 if (empty($user->id)) {
@@ -80,7 +81,7 @@ class AccountingLedgerApiTest extends CommonClassTest
 	 */
 	private function createFiscalPeriod($year)
 	{
-		global $db,$user;
+		global $conf,$db,$user;
 
 		$period = new Fiscalyear($db);
 		$period->label = 'AccountingLedgerApiTest period '.$year;
@@ -89,8 +90,23 @@ class AccountingLedgerApiTest extends CommonClassTest
 		$period_id = $period->create($user);
 		$this->assertGreaterThan(0, $period_id, $period->errorsToString());
 
+		// BookKeeping::validBookkeepingDate()/loadFiscalPeriods() caches the active-fiscal-period
+		// list per process and never auto-refreshes it, so a later test method's freshly created
+		// period would otherwise be invisible to BookKeeping::create()'s date check.
+		unset($conf->cache['active_fiscal_period_cached']);
+
 		return $period_id;
 	}
+
+	/**
+	 * @var int Sequence used to keep each createLedgerLine() fixture's (numero_compte,
+	 *          label_operation, subledger_account) tuple unique, since initAsSpecimen()'s fixed
+	 *          defaults for those fields would otherwise collide with BookKeeping::create()'s own
+	 *          duplicate-detection uniqueness check (doc_type+fk_doc+numero_compte+label_operation+
+	 *          subledger_account+entity) as soon as more than one fixture line is created without
+	 *          overriding them.
+	 */
+	private static $ledgerLineSeq = 0;
 
 	/**
 	 * Create a bookkeeping line fixture inside the given year.
@@ -105,9 +121,13 @@ class AccountingLedgerApiTest extends CommonClassTest
 	{
 		global $db,$user;
 
+		self::$ledgerLineSeq++;
+
 		$line = new BookKeeping($db);
 		$line->initAsSpecimen();
 		$line->doc_date = dol_mktime(12, 0, 0, 6, 15, $year);
+		$line->numero_compte = '411'.self::$ledgerLineSeq;
+		$line->label_operation = 'AccountingLedgerApiTest line '.self::$ledgerLineSeq;
 		foreach ($overrides as $field => $value) {
 			$line->$field = $value;
 		}
@@ -149,7 +169,7 @@ class AccountingLedgerApiTest extends CommonClassTest
 
 		// GET
 		$fetched = $api->getLedgerEntry($clean->id);
-		$this->assertSame($clean->id, $fetched->id);
+		$this->assertSame((int) $clean->id, (int) $fetched->id);
 
 		// PUT on a clean line succeeds and persists.
 		$updated = $api->putLedgerEntry($clean->id, array('label_operation' => 'Updated via API test', 'debit' => 111.0));
@@ -381,6 +401,69 @@ class AccountingLedgerApiTest extends CommonClassTest
 	}
 
 	/**
+	 * getLedger()'s date_start/date_end must filter correctly whether passed as a raw Unix
+	 * timestamp (what the accounting MCP server sends, see roadmap/API_GAPS.md #6) or as a
+	 * 'YYYY-MM-DD' string, and must reject an unparseable value with a 400 instead of silently
+	 * producing a wrong (near-empty) result.
+	 *
+	 * @return void
+	 */
+	public function testGetLedgerDateFilterAcceptsTimestampAndDateString()
+	{
+		global $conf,$user,$langs,$db;
+		$conf = $this->savconf;
+		$user = $this->savuser;
+		$langs = $this->savlangs;
+		$db = $this->savdb;
+
+		DolibarrApiAccess::$user = $user;
+
+		$api = new Accountancy();
+
+		$year = 2907;
+		$this->createFiscalPeriod($year);
+
+		$docDate = dol_mktime(12, 0, 0, 6, 15, $year);
+		$line = $this->createLedgerLine($year, array('piece_num' => 6301, 'doc_date' => $docDate));
+
+		// Raw Unix timestamps bracketing doc_date (the MCP server's actual usage pattern). Bracket
+		// the whole day rather than +/-1h: t.doc_date is a plain DATE column (no time component),
+		// so the stored value is truncated to midnight regardless of the time-of-day doc_date was
+		// created with.
+		$dayStart = dol_mktime(0, 0, 0, 6, 15, $year);
+		$dayEnd = dol_mktime(23, 59, 59, 6, 15, $year);
+		$result = $api->getLedger('t.piece_num, t.rowid', 'ASC', 100, 0, '', (string) $dayStart, (string) $dayEnd);
+		$ids = array_map(function ($l) {
+			return (int) $l->id;
+		}, $result);
+		$this->assertContains((int) $line->id, $ids, 'getLedger must match doc_date when date_start/date_end are raw Unix timestamps');
+
+		// 'YYYY-MM-DD' strings bracketing doc_date must still work.
+		$result2 = $api->getLedger('t.piece_num, t.rowid', 'ASC', 100, 0, '', $year.'-06-14', $year.'-06-16');
+		$ids2 = array_map(function ($l) {
+			return (int) $l->id;
+		}, $result2);
+		$this->assertContains((int) $line->id, $ids2, 'getLedger must match doc_date when date_start/date_end are YYYY-MM-DD strings');
+
+		// A date range not covering doc_date must exclude the line.
+		$result3 = $api->getLedger('t.piece_num, t.rowid', 'ASC', 100, 0, '', $year.'-01-01', $year.'-01-02');
+		$ids3 = array_map(function ($l) {
+			return (int) $l->id;
+		}, $result3);
+		$this->assertNotContains((int) $line->id, $ids3, 'getLedger must exclude lines outside the requested date range');
+
+		// An unparseable date_start must be rejected with a 400, not silently miscomputed.
+		$rejected = false;
+		try {
+			$api->getLedger('t.piece_num, t.rowid', 'ASC', 100, 0, '', 'not-a-date');
+		} catch (RestException $e) {
+			$rejected = true;
+			$this->assertSame(400, $e->getCode());
+		}
+		$this->assertTrue($rejected, 'getLedger must reject an unparseable date_start with a 400');
+	}
+
+	/**
 	 * POST thirdparties/{id}/lettering (auto-lettering entry point) does not throw for a
 	 * thirdparty with no matching candidates, and is gated by ACCOUNTING_ENABLE_LETTERING.
 	 *
@@ -402,6 +485,7 @@ class AccountingLedgerApiTest extends CommonClassTest
 		$thirdparty = new Societe($db);
 		$thirdparty->name = 'AccountingLedgerApiTest thirdparty';
 		$thirdparty->client = 1;
+		$thirdparty->code_client = '-1'; // '-1' = auto-generate, per this test DB's configured customer-code mask
 		$thirdparty->code_compta = 'LEDGERAPITESTTP';
 		$thirdparty_id = $thirdparty->create($user);
 		$this->assertGreaterThan(0, $thirdparty_id, implode(',', $thirdparty->errors));

@@ -300,16 +300,16 @@ class Accountancy extends DolibarrApi
 	 * @param   int     $limit                  Limit for list
 	 * @param   int     $page                   Page number
 	 * @param   string  $type                   '' or 'general' for general account listing, 'sub' for subledger (auxiliary) account listing
-	 * @param   string  $date_start             Filter on doc_date >= (format YYYY-MM-DD)
-	 * @param   string  $date_end               Filter on doc_date <= (format YYYY-MM-DD)
+	 * @param   string  $date_start             Filter on doc_date >= (format YYYY-MM-DD or Unix timestamp)
+	 * @param   string  $date_end               Filter on doc_date <= (format YYYY-MM-DD or Unix timestamp)
 	 * @param   string  $account_min            Filter on account number range (general account, or subledger account if type=sub) >=
 	 * @param   string  $account_max            Filter on account number range (general account, or subledger account if type=sub) <=
 	 * @param   string  $code_journal           Filter on journal code(s), comma separated for multiple
 	 * @param   int     $piece_num              Filter on piece number
 	 * @param   int     $fk_doc                 Filter on source document id
 	 * @param   int     $fk_docdet              Filter on source document line id
-	 * @param   string  $date_validation_start  Filter on date_validated >= (format YYYY-MM-DD)
-	 * @param   string  $date_validation_end    Filter on date_validated <= (format YYYY-MM-DD)
+	 * @param   string  $date_validation_start  Filter on date_validated >= (format YYYY-MM-DD or Unix timestamp)
+	 * @param   string  $date_validation_end    Filter on date_validated <= (format YYYY-MM-DD or Unix timestamp)
 	 * @param   string  $export_status          '' or 'all' to show already exported movements (default), 'notexported' to hide them. Ignored when type=sub
 	 * @param   int     $reconciled             1 to show all movements (default), 0 to show only unreconciled (unlettered) movements
 	 * @param   string  $sqlfilters             Other criteria to filter answers, syntax example "(t.numero_compte:like:'411%')". Mutually exclusive with the filters above; not supported when type=sub
@@ -358,11 +358,13 @@ class Accountancy extends DolibarrApi
 			if (!empty($fk_docdet)) {
 				$filter['t.fk_docdet'] = (int) $fk_docdet;
 			}
-			if ($date_validation_start !== '') {
-				$filter['t.date_validated>='] = strtotime($date_validation_start);
+			$date_validation_start_ts = $this->_parseApiDateFilter($date_validation_start, 'date_validation_start');
+			if ($date_validation_start_ts !== null) {
+				$filter['t.date_validated>='] = $date_validation_start_ts;
 			}
-			if ($date_validation_end !== '') {
-				$filter['t.date_validated<='] = strtotime($date_validation_end);
+			$date_validation_end_ts = $this->_parseApiDateFilter($date_validation_end, 'date_validation_end');
+			if ($date_validation_end_ts !== null) {
+				$filter['t.date_validated<='] = $date_validation_end_ts;
 			}
 		}
 
@@ -414,8 +416,8 @@ class Accountancy extends DolibarrApi
 	 * Get the trial balance (bookkeeping entries grouped and summed by account)
 	 *
 	 * @param   string  $type           '' or 'general' to group by general account (default), 'sub' to group by subledger (auxiliary) account
-	 * @param   string  $date_start     Filter on doc_date >= (format YYYY-MM-DD)
-	 * @param   string  $date_end       Filter on doc_date <= (format YYYY-MM-DD)
+	 * @param   string  $date_start     Filter on doc_date >= (format YYYY-MM-DD or Unix timestamp)
+	 * @param   string  $date_end       Filter on doc_date <= (format YYYY-MM-DD or Unix timestamp)
 	 * @param   string  $account_min    Filter on account number range (general account, or subledger account if type=sub) >=
 	 * @param   string  $account_max    Filter on account number range (general account, or subledger account if type=sub) <=
 	 * @param   string  $code_journal   Filter on journal code(s), comma separated for multiple
@@ -1092,11 +1094,37 @@ class Accountancy extends DolibarrApi
 	}
 
 	/**
+	 * Parse a date filter parameter, accepting either a Unix timestamp (int or numeric string)
+	 * or a date string parseable by strtotime() (e.g. 'YYYY-MM-DD'). Used because strtotime() on a
+	 * bare numeric-seconds string (a raw Unix timestamp) returns false, which callers used to pass
+	 * straight into a SQL filter and get silently coerced to timestamp 0 instead of a real date.
+	 *
+	 * @param   string  $value      Raw parameter value, or '' for "no filter"
+	 * @param   string  $paramname  Parameter name, used in the error message
+	 * @return  int|null            Unix timestamp, or null if $value === ''
+	 * @throws  RestException  400  If $value is not empty and not parseable
+	 */
+	private function _parseApiDateFilter($value, $paramname)
+	{
+		if ($value === '') {
+			return null;
+		}
+		if (is_numeric($value)) {
+			return (int) $value;
+		}
+		$timestamp = strtotime($value);
+		if ($timestamp === false) {
+			throw new RestException(400, "Invalid date value for $paramname: $value");
+		}
+		return $timestamp;
+	}
+
+	/**
 	 * Build the array-form BookKeeping filter shared by getLedger() and getLedgerBalance()
 	 *
 	 * @param   string  $type           '' or 'general' or 'sub'
-	 * @param   string  $date_start     Filter on doc_date >= (format YYYY-MM-DD)
-	 * @param   string  $date_end       Filter on doc_date <= (format YYYY-MM-DD)
+	 * @param   string  $date_start     Filter on doc_date >= (format YYYY-MM-DD or Unix timestamp)
+	 * @param   string  $date_end       Filter on doc_date <= (format YYYY-MM-DD or Unix timestamp)
 	 * @param   string  $account_min    Filter on account number range >=
 	 * @param   string  $account_max    Filter on account number range <=
 	 * @param   string  $code_journal   Filter on journal code(s), comma separated for multiple
@@ -1104,17 +1132,20 @@ class Accountancy extends DolibarrApi
 	 * @return  array
 	 * @phan-return array<string,mixed>
 	 * @phpstan-return array<string,mixed>
+	 * @throws  RestException  400  If date_start or date_end is not empty and not parseable
 	 */
 	private function _buildLedgerFilter($type, $date_start, $date_end, $account_min, $account_max, $code_journal, $reconciled)
 	{
 		$filter = array();
 		$accountkey = ($type == 'sub') ? 't.subledger_account' : 't.numero_compte';
 
-		if ($date_start !== '') {
-			$filter['t.doc_date>='] = strtotime($date_start);
+		$date_start_ts = $this->_parseApiDateFilter($date_start, 'date_start');
+		if ($date_start_ts !== null) {
+			$filter['t.doc_date>='] = $date_start_ts;
 		}
-		if ($date_end !== '') {
-			$filter['t.doc_date<='] = strtotime($date_end);
+		$date_end_ts = $this->_parseApiDateFilter($date_end, 'date_end');
+		if ($date_end_ts !== null) {
+			$filter['t.doc_date<='] = $date_end_ts;
 		}
 		if ($account_min !== '') {
 			$filter[$accountkey.'>='] = $account_min;

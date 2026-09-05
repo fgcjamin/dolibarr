@@ -683,13 +683,13 @@ class BankAccounts extends DolibarrApi
 	 *
 	 * @param int    $id                ID of account
 	 * @param int    $line_id           ID of account line
-	 * @param string $label             Label {@from body}
+	 * @param string $label             Label. Leave empty to keep it unchanged. {@from body}
 	 * @param string $accountancycode   Accountancy code. Leave empty to keep it unchanged. {@from body}
 	 * @return int  ID of link
 	 *
 	 * @url PUT {id}/lines/{line_id}
 	 */
-	public function updateLine($id, $line_id, $label, $accountancycode = '')
+	public function updateLine($id, $line_id, $label = '', $accountancycode = '')
 	{
 		if (!DolibarrApiAccess::$user->rights->banque->modifier) {
 			throw new RestException(403);
@@ -711,11 +711,13 @@ class BankAccounts extends DolibarrApi
 			throw new RestException(400, 'Line does not belong to this account');
 		}
 
-		$accountLine->label = sanitizeVal($label);
+		if ($label !== '') {
+			$accountLine->label = sanitizeVal($label);
 
-		$result = $accountLine->updateLabel();
-		if ($result < 0) {
-			throw new RestException(503, 'Error when updating link to account line: ' . $accountLine->error);
+			$result = $accountLine->updateLabel();
+			if ($result < 0) {
+				throw new RestException(503, 'Error when updating link to account line: ' . $accountLine->error);
+			}
 		}
 
 		if ($accountancycode !== '') {

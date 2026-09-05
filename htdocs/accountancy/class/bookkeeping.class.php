@@ -865,6 +865,8 @@ class BookKeeping extends CommonObject
 		$sql .= " t.piece_num,";
 		$sql .= " t.ref,";
 		$sql .= " t.date_creation,";
+		$sql .= " t.lettering_code,";
+		$sql .= " t.date_lettering,";
 		// In llx_accounting_bookkeeping_tmp, date_export
 		if (!$mode) {
 			$sql .= " t.date_export,";
@@ -915,6 +917,8 @@ class BookKeeping extends CommonObject
 				}
 				$this->ref = $obj->ref;
 				$this->date_validation = isset($obj->date_validation) ? $this->db->jdate($obj->date_validation) : '';
+				$this->lettering_code = $obj->lettering_code;
+				$this->date_lettering = $this->db->jdate($obj->date_lettering);
 			}
 			$this->db->free($resql);
 
